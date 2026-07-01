@@ -51,29 +51,14 @@ def step2_filter_trunk_schedule(schedule, trunk_set):
 def step3_build_traces(trunk_sched, bill):
 
     trunk_sched = trunk_sched.sort_values(["bill_code", "io_time"])
-    
-    # Identify blocks of consecutive rows for the same bill at the same warehouse
-    block_id = ((trunk_sched["bill_code"] != trunk_sched["bill_code"].shift()) | 
-                (trunk_sched["warehouse_name"] != trunk_sched["warehouse_name"].shift())).cumsum()
-    
-    # Calculate arrival (min) and departure (max) time for each block
-    blocks = trunk_sched.groupby(block_id).agg(
-        bill_code=("bill_code", "first"),
-        warehouse_name=("warehouse_name", "first"),
-        arrival_time=("io_time", "min"),
-        departure_time=("io_time", "max")
-    )
-    
-    # Format warehouse name and times: tên kho-thời gian đến-thời gian đi
-    blocks["arrival_str"] = blocks["arrival_time"].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('')
-    blocks["departure_str"] = blocks["departure_time"].dt.strftime('%Y-%m-%d %H:%M:%S').fillna('')
-    blocks["node_str"] = blocks["warehouse_name"].astype(str) + "-" + blocks["arrival_str"] + "-" + blocks["departure_str"]
-    
-    grp = blocks.groupby("bill_code")
+    m = trunk_sched["warehouse_name"] != trunk_sched.groupby("bill_code")["warehouse_name"].shift()
+    trunk_sched = trunk_sched[m]
+
+    grp = trunk_sched.groupby("bill_code")
 
     first_trunk = grp["warehouse_name"].first().rename("first_trunk")
     last_trunk = grp["warehouse_name"].last().rename("last_trunk")
-    trunk_route = grp["node_str"].apply(lambda x: " → ".join(x)).rename("trunk_route")
+    trunk_route = grp["warehouse_name"].apply(lambda x: " → ".join(x)).rename("trunk_route")
     n_trunk = grp["warehouse_name"].nunique().rename("n_trunk_stops")
 
     traces = pd.concat([first_trunk, last_trunk, trunk_route, n_trunk], axis=1).reset_index()
@@ -85,10 +70,10 @@ def step3_build_traces(trunk_sched, bill):
         how='left'
     )
     # Rename columns to match user's request
-    traces = traces.rename(columns={
-        'receiving_date': 'thoi_gian_khach_giao_hang',
-        'actual_delivery_date': 'thoi_gian_khach_nhan'
-    })
+    # traces = traces.rename(columns={
+    #     'receiving_date': 'thoi_gian_khach_giao_hang',
+    #     'actual_delivery_date': 'thoi_gian_khach_nhan'
+    # })
 
     traces.to_csv(os.path.join(OUTPUT_DIR, "bill_trunk_traces.csv"), index=False)
     return traces 

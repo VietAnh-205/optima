@@ -11,49 +11,16 @@ OUTPUT_DIR = "output_routes"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def load_data(traces, warehouse, bill, warehouse_1a): 
+def load_data(traces, warehouse, bill): 
     wh = pd.read_csv(warehouse)
     wh_prov = wh.set_index('name')['province_name'].to_dict() 
     
-    wh_1a = pd.read_csv(warehouse_1a)
-    wh_1a_names = set(wh_1a['name'].dropna())
-    def mark_1a(name):
-        if not isinstance(name, str):
-            return name
-        return f"{name} (1A)" if name in wh_1a_names else name
-    import re
-    # Match warehouse name and up to two optional timestamp segments
-    pattern = r"^(.*?)(-(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|))(-(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}|))$"
-    
-    def mark_route_1a(route_str):
-        if not isinstance(route_str, str):
-            return route_str
-        nodes = route_str.split(" → ")
-        new_nodes = []
-        for node in nodes:
-            m = re.match(pattern, node)
-            if m:
-                name = m.group(1)
-                new_name = mark_1a(name)
-                new_nodes.append(f"{new_name}{m.group(2)}{m.group(3)}")
-            else:
-                new_nodes.append(node)
-        return " → ".join(new_nodes)
     chunks = []
     traces_reader = pd.read_csv(traces, chunksize= CHUNKSIZE) 
     for chunk in traces_reader: 
-        chunk['first_trunk'] = chunk['first_trunk'].apply(mark_1a)
-        chunk['last_trunk'] = chunk['last_trunk'].apply(mark_1a)
-        if 'trunk_route' in chunk.columns:
-            chunk['trunk_route'] = chunk['trunk_route'].apply(mark_route_1a)
         chunks.append(chunk)
     
     routes = pd.concat(chunks, ignore_index = True) 
-    # Update mapping with new 1A names
-    new_wh_prov = {}
-    for k, v in wh_prov.items():
-        new_wh_prov[mark_1a(k)] = v
-    wh_prov = new_wh_prov
     bill_df = pd.read_csv(bill, usecols = ['bill_code', 'origin_province', 'actual_weight'])
     routes = routes.merge(bill_df, on = 'bill_code', how = 'left')   
     return routes, wh_prov
@@ -71,9 +38,7 @@ def route_distribution(df, wh_prov):
         df.groupby(['first_trunk', 'last_trunk', 'trunk_route'])
         .agg(
             so_bill = ('bill_code', 'nunique'), 
-            tong_kg = ('actual_weight','sum'),
-            thoi_gian_khach_giao_hang = ('thoi_gian_khach_giao_hang', 'first') if 'thoi_gian_khach_giao_hang' in df.columns else ('bill_code', 'first'),
-            thoi_gian_khach_nhan = ('thoi_gian_khach_nhan', 'first') if 'thoi_gian_khach_nhan' in df.columns else ('bill_code', 'first')
+            tong_kg = ('actual_weight','sum')
         ).
         reset_index()
     )
@@ -157,8 +122,7 @@ if __name__ == "__main__":
     routes, wh_prov = load_data(
         "output_all_traces/bill_trunk_traces.csv",
         "warehouse.csv",
-        "bill.csv",
-        "warehouse_1A.csv"
+        "bill.csv"
     )
     # df  = filter_bill(routes)
 

@@ -272,9 +272,9 @@ js_data = json.dumps({
         ps[ps["tong_bill"] >= 100]
         .rename(columns={
             "first_trunk": "from_wh", "last_trunk": "to_wh", 
-            "pct_route_chinh_bill": "pct", "so_route_theo_cap": "n_routes"
+            "pct_route_chinh_bill": "pct", "so_route_theo_cap": "n_routes", "tong_bill": "bills"
         })
-        [["from_wh", "to_wh", "pct", "n_routes"]]
+        [["from_wh", "to_wh", "pct", "n_routes", "bills"]]
         .to_dict("records")
     ),
     "top_hubs":    top_hubs,
@@ -552,7 +552,6 @@ tbody td{padding:7px 10px;vertical-align:middle}
     <div class="subtitle">
       X = Tỉ lệ % route chính (cao → cung đường cố định). 
       Y = Số lượng routes khác nhau. Kích thước = tổng bill. (Chỉ lấy các cặp >= 100 bills). 
-      <b style="color:var(--accent)">Click vào bong bóng của cặp kho bất kỳ để xem chi tiết!</b>
     </div>
     <div class="chart-wrap" style="height:420px;margin-bottom:20px;">
       <canvas id="chart-scatter-pairs"></canvas>
@@ -985,19 +984,6 @@ function initTab2() {
     },
     options: {
       responsive: true, maintainAspectRatio: false,
-      onClick: (event, elements, chart) => {
-        if (elements.length > 0) {
-          const dataIndex = elements[0].index;
-          const datasetIndex = elements[0].datasetIndex;
-          const d = chart.data.datasets[datasetIndex].data[dataIndex];
-          if (typeof viewRouteDetail === 'function') {
-            viewRouteDetail(d.from, d.to);
-          }
-        }
-      },
-      onHover: (event, elements, chart) => {
-        event.native.target.style.cursor = elements[0] ? 'pointer' : 'default';
-      },
       plugins: {
         legend: {display: false},
         tooltip: {
