@@ -125,7 +125,10 @@ def build_html_report(out_origin, out_dest, sum_o, sum_d):
   h3   {{ color:#374151; }}
   h4   {{ color:#1e3a5f; background:#EFF6FF; padding:8px 12px; border-radius:6px; margin:18px 0 6px; }}
   .tbl {{ border-collapse:collapse; width:100%; font-size:12px; }}
-  .tbl th {{ background:#2563EB; color:#fff; padding:7px 10px; text-align:left; position:sticky; top:0; }}
+  .tbl th {{ background:#2563EB; color:#fff; padding:7px 10px; text-align:left; position:sticky; top:0; cursor:pointer; user-select:none; }}
+  .tbl th::after {{ content: ' ↕'; opacity: 0.5; font-size: 0.8em; }}
+  .tbl th.asc::after {{ content: ' ↑'; opacity: 1; }}
+  .tbl th.desc::after {{ content: ' ↓'; opacity: 1; }}
   .tbl td {{ border-bottom:1px solid #E5E7EB; padding:5px 10px; }}
   .tbl tr:hover td {{ background:#EFF6FF; }}
   .pair-block {{ margin:16px 0; padding:12px; background:#fff; border-radius:8px; box-shadow:0 1px 4px rgba(0,0,0,.08); }}
@@ -144,6 +147,35 @@ function switchTab(id) {{
   document.getElementById(id).classList.add('active');
   document.querySelector('[onclick*="'+id+'"]').classList.add('active');
 }}
+
+document.addEventListener('DOMContentLoaded', () => {{
+  document.querySelectorAll('.tbl th').forEach(th => {{
+    th.title = 'Nhấn để sắp xếp';
+    th.addEventListener('click', () => {{
+      const table = th.closest('table');
+      const tbody = table.querySelector('tbody');
+      const rows = Array.from(tbody.querySelectorAll('tr'));
+      const idx = Array.from(th.parentNode.children).indexOf(th);
+      const isAsc = th.classList.contains('asc');
+      
+      table.querySelectorAll('th').forEach(h => h.classList.remove('asc', 'desc'));
+      th.classList.add(isAsc ? 'desc' : 'asc');
+      
+      rows.sort((a, b) => {{
+        let valA = a.children[idx].innerText.trim();
+        let valB = b.children[idx].innerText.trim();
+        let numA = parseFloat(valA.replace(/,/g, ''));
+        let numB = parseFloat(valB.replace(/,/g, ''));
+        
+        if(!isNaN(numA) && !isNaN(numB) && valA !== '' && valB !== '') {{
+          return isAsc ? numB - numA : numA - numB;
+        }}
+        return isAsc ? valB.localeCompare(valA) : valA.localeCompare(valB);
+      }});
+      tbody.append(...rows);
+    }});
+  }});
+}});
 </script>
 </head>
 <body>

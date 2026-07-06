@@ -15,7 +15,7 @@ LABELS = ["0-1h","1-2h","2-3h","3-4h","4-5h","5-6h","6-8h","8-10h","10-12h",
 
 BAR_COLOR, VIOLIN_COLOR = "#2563EB", "#1D4ED8"
 N_TOP     = 10
-FIG_WIDTH = 1500
+FIG_WIDTH = 1400 
 BAR_ROW_H = 1000
 
 # Violin: mỗi cặp kho chiếm 1 khối 24 hàng x 1 cột = 24 ô (mỗi ô 1 giờ)
@@ -118,99 +118,310 @@ def build_bar_fig(df, pairs, top, sort_label, title_prefix):
     return fig
 
 
-def build_violin_fig(df, pairs, time_col, title_prefix, sort_label):
+def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label):
     rows = len(pairs)
+    cols = 2
     
-    gap_px = 40
-    # Chiều cao cho 1 CẶP KHO (chứa 24 giờ bên trong)
-    V_PAIR_H = 2500
+    gap_px = 60
+    # Chiều cao cho mỗi biểu đồ: 1500px x 2 = 3000px
+    V_PAIR_H = 3000
     total_plot_height = rows * V_PAIR_H + (rows - 1) * gap_px
-    v_space = gap_px / total_plot_height if rows > 1 else 0.0
 
-    fig = make_subplots(rows=rows, cols=1, subplot_titles=pairs,
-                         vertical_spacing=0.01)
+    grid_rows = rows * 2
+    specs = []
+    subplot_titles = []
+    
+    for pair in pairs:
+        specs.append([{"type": "xy"}, {"type": "xy"}])
+        specs.append([{"type": "xy"}, {"type": "xy"}])
+        
+        subplot_titles.append(f"{pair}<br>({time_labels[0]} vs T.gian VC)")
+        subplot_titles.append(f"{pair}<br>({time_labels[1]} vs T.gian VC)")
+        subplot_titles.append(f"{pair}<br>Tương quan: {time_labels[0]} theo {time_labels[1]}")
+        subplot_titles.append(f"{pair}<br>Tương quan: {time_labels[1]} theo {time_labels[0]}")
+
+    fig = make_subplots(rows=grid_rows, cols=cols, subplot_titles=subplot_titles,
+                         vertical_spacing=0.015, horizontal_spacing=0.1, specs=specs)
+    
+    VIOLIN_COLORS = ["#10B981", "#1D4ED8"]
+    VIOLIN_FILLS  = ["rgba(16,185,129,0.15)", "rgba(29,78,216,0.15)"]
 
     for p, pair in enumerate(pairs):
-        r = ax = p + 1
-        sub_raw = df.loc[df["pair"] == pair, [time_col, "time"]].dropna()
-        if sub_raw.empty:
-            fig.add_annotation(text="Không có dữ liệu", xref=axref(ax, "x", " domain"),
-                                yref=axref(ax, "y", " domain"), x=0.5, y=0.5,
-                                showarrow=False, font=dict(size=11, color="#9CA3AF"))
-            continue
-
-        # Giới hạn Y ≤ P99 để tránh outlier
-        # cap = sub_raw["time"].quantile(0.99)
-        # sub = sub_raw[sub_raw["time"] <= cap].copy()
-        sub = sub_raw.copy()
-        sub_raw["hour"] = pd.to_datetime(sub_raw[time_col]).dt.hour
-        sub["hour"] = pd.to_datetime(sub[time_col]).dt.hour
+        grid_r_start = p * 2 + 1
         
-        total_bills = len(sub_raw)
-        y_cats = []
-        stats = {}
-        for h in range(24):
-            count_h = len(sub_raw[sub_raw["hour"] == h])
-            pct_h = (count_h / total_bills * 100) if total_bills > 0 else 0
-            label = f"{h}-{h+1}h<br>{count_h:,} ({pct_h:.1f}%)"
-            y_cats.append(label)
-            stats[h] = (label, count_h, pct_h)
-
-        for h in range(24):
-            x_vals = sub.loc[sub["hour"] == h, "time"].values
-            if len(x_vals) < 2:
-                continue
+        # ==========================================
+        # Row 1: The two side-by-side Violins
+        # ==========================================
+        for c, t_col in enumerate(time_cols):
+            col_idx = c + 1
             
-            label, count_h, pct_h = stats[h]
-            fig.add_trace(go.Violin(
-                x=x_vals.tolist(),
-                y=[label] * len(x_vals),
-                name=label, line_color=VIOLIN_COLOR,
-                fillcolor="rgba(29,78,216,0.15)", box_visible=True, meanline_visible=True,
-                points='outliers', showlegend=False, orientation='h',
-                hovertemplate=(
-                    f"<b>{h}h–{h+1}h</b><br>"
-                    f"Số bill: {count_h:,} ({pct_h:.1f}%)<br>"
-                    f"Thời gian vc: %{{x:.0f}}h<br>"
-                    f"Cặp: {pair}<extra></extra>"
-                ),
-            ), row=r, col=1)
+            sub_raw = df.loc[df["pair"] == pair, [t_col, "time"]].dropna()
+            if sub_raw.empty:
+                continue
 
-        fig.update_xaxes(title_text="Thời gian vc (h)", showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
-        # Đảo ngược mảng để 0-1h ở trên cùng, 23-24h ở dưới cùng
-        fig.update_yaxes(categoryorder="array", categoryarray=y_cats[::-1], showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
+            sub = sub_raw[(sub_raw["time"] <= 100) & (sub_raw['time'] >= 0)].copy()
+            sub_raw["hour"] = pd.to_datetime(sub_raw[t_col]).dt.hour
+            sub["hour"] = pd.to_datetime(sub[t_col]).dt.hour
+            
+            total_bills = len(sub_raw)
+            y_cats = []
+            stats = {}
+            for h in range(24):
+                count_h = len(sub_raw[sub_raw["hour"] == h])
+                pct_h = (count_h / total_bills * 100) if total_bills > 0 else 0
+                label = f"{h}-{h+1}h<br>{count_h:,} ({pct_h:.1f}%)"
+                y_cats.append(label)
+                stats[h] = (label, count_h, pct_h)
+
+            for h in range(24):
+                x_vals = sub.loc[sub["hour"] == h, "time"].values
+                label, count_h, pct_h = stats[h]
+                
+                if len(x_vals) < 2:
+                    # Add dummy trace to preserve the Y category label
+                    fig.add_trace(go.Violin(x=[None], y=[label], name=label, showlegend=False, hoverinfo='skip'), row=grid_r_start, col=col_idx)
+                    continue
+                
+                fig.add_trace(go.Violin(
+                    x=x_vals.tolist(),
+                    y=[label] * len(x_vals),
+                    name=label, line_color=VIOLIN_COLORS[c],
+                    fillcolor=VIOLIN_FILLS[c], box_visible=True, meanline_visible=True,
+                    points='outliers', showlegend=False, orientation='h', spanmode='hard',
+                    hovertemplate=(
+                        f"<b>{h}h–{h+1}h</b><br>"
+                        f"Mốc: {time_labels[c]}<br>"
+                        f"Số bill: {count_h:,} ({pct_h:.1f}%)<br>"
+                        f"Thời gian vc: %{{x:.0f}}h<br>"
+                        f"Cặp: {pair}<extra></extra>"
+                    ),
+                ), row=grid_r_start, col=col_idx)
+
+            fig.update_xaxes(title_text="Thời gian vc (h)", showgrid=True, gridcolor="#E5E7EB", row=grid_r_start, col=col_idx)
+            fig.update_yaxes(categoryorder="array", categoryarray=y_cats[::-1], showgrid=True, gridcolor="#E5E7EB", row=grid_r_start, col=col_idx)
+
+        # ==========================================
+        # Row 2: Inter-hour Violin (Left & Right)
+        # ==========================================
+        t_col_1, t_col_2 = time_cols[0], time_cols[1]
+        sub2_raw = df.loc[df["pair"] == pair, [t_col_1, t_col_2]].dropna()
+        if not sub2_raw.empty:
+            dt1 = pd.to_datetime(sub2_raw[t_col_1])
+            dt2 = pd.to_datetime(sub2_raw[t_col_2])
+            
+            sub2_raw["hour_1_cont"] = dt1.dt.hour + dt1.dt.minute / 60.0 + dt1.dt.second / 3600.0
+            sub2_raw["hour_2_cont"] = dt2.dt.hour + dt2.dt.minute / 60.0 + dt2.dt.second / 3600.0
+            sub2_raw["hour_1"] = dt1.dt.hour
+            sub2_raw["hour_2"] = dt2.dt.hour
+            
+            total_bills_2 = len(sub2_raw)
+            
+            # --- LEFT PLOT ---
+            y_cats_left = []
+            stats_left = {}
+            for h in range(24):
+                count_h = len(sub2_raw[sub2_raw["hour_2"] == h])
+                pct_h = (count_h / total_bills_2 * 100) if total_bills_2 > 0 else 0
+                label = f"{h}-{h+1}h<br>{count_h:,} ({pct_h:.1f}%)"
+                y_cats_left.append(label)
+                stats_left[h] = (label, count_h, pct_h)
+                
+            for h in range(24):
+                x_vals = sub2_raw.loc[sub2_raw["hour_2"] == h, "hour_1_cont"].values
+                label = stats_left[h][0]
+                
+                if len(x_vals) < 2:
+                    fig.add_trace(go.Violin(x=[None], y=[label], name=label, showlegend=False, hoverinfo='skip'), row=grid_r_start + 1, col=1)
+                    continue
+                
+                fig.add_trace(go.Violin(
+                    x=x_vals.tolist(), y=[label] * len(x_vals),
+                    name=label, line_color="#8B5CF6", fillcolor="rgba(139,92,246,0.15)",
+                    box_visible=True, meanline_visible=True, points='outliers',
+                    showlegend=False, orientation='h', spanmode='hard',
+                    hovertemplate=(f"<b>{h}h–{h+1}h tại {time_labels[1]}</b><br>Giờ tại {time_labels[0]}: %{{x:.1f}}h<extra></extra>")
+                ), row=grid_r_start + 1, col=1)
+                
+            fig.update_xaxes(title_text=f"Giờ tại {time_labels[0]} (0-24h)", range=[0, 24], dtick=2, showgrid=True, gridcolor="#E5E7EB", row=grid_r_start + 1, col=1)
+            fig.update_yaxes(categoryorder="array", categoryarray=y_cats_left[::-1], title_text=f"Khung giờ {time_labels[1]}", showgrid=True, gridcolor="#E5E7EB", row=grid_r_start + 1, col=1)
+
+            # --- RIGHT PLOT ---
+            y_cats_right = []
+            stats_right = {}
+            for h in range(24):
+                count_h = len(sub2_raw[sub2_raw["hour_1"] == h])
+                pct_h = (count_h / total_bills_2 * 100) if total_bills_2 > 0 else 0
+                label = f"{h}-{h+1}h<br>{count_h:,} ({pct_h:.1f}%)"
+                y_cats_right.append(label)
+                stats_right[h] = (label, count_h, pct_h)
+                
+            for h in range(24):
+                x_vals = sub2_raw.loc[sub2_raw["hour_1"] == h, "hour_2_cont"].values
+                label = stats_right[h][0]
+                
+                if len(x_vals) < 2:
+                    fig.add_trace(go.Violin(x=[None], y=[label], name=label, showlegend=False, hoverinfo='skip'), row=grid_r_start + 1, col=2)
+                    continue
+                
+                fig.add_trace(go.Violin(
+                    x=x_vals.tolist(), y=[label] * len(x_vals),
+                    name=label, line_color="#F59E0B", fillcolor="rgba(245,158,11,0.15)", # Amber
+                    box_visible=True, meanline_visible=True, points='outliers',
+                    showlegend=False, orientation='h', spanmode='hard',
+                    hovertemplate=(f"<b>{h}h–{h+1}h tại {time_labels[0]}</b><br>Giờ tại {time_labels[1]}: %{{x:.1f}}h<extra></extra>")
+                ), row=grid_r_start + 1, col=2)
+                
+            fig.update_xaxes(title_text=f"Giờ tại {time_labels[1]} (0-24h)", range=[0, 24], dtick=2, showgrid=True, gridcolor="#E5E7EB", row=grid_r_start + 1, col=2)
+            fig.update_yaxes(categoryorder="array", categoryarray=y_cats_right[::-1], title_text=f"Khung giờ {time_labels[0]}", showgrid=True, gridcolor="#E5E7EB", row=grid_r_start + 1, col=2)
 
     fig.update_layout(
         title=dict(
-            text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} theo {sort_label} — Violin: từng giờ tại kho 1A vs thời gian vận chuyển</sup>",
+            text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} theo {sort_label} — Violin: phân phối theo giờ tại 2 mốc vs thời gian vận chuyển</sup>",
             x=0.5, xanchor="center", font=dict(size=15)),
-        height=total_plot_height + 90 + 30, width=FIG_WIDTH, showlegend=False,
+        height=total_plot_height + 120, width=FIG_WIDTH, showlegend=False,
         plot_bgcolor="#F9FAFB", paper_bgcolor="#FFFFFF",
         font=dict(family="Segoe UI, Arial", size=11),
-        margin=dict(t=90, b=30, l=70, r=40), violingap=0)
+        margin=dict(t=110, b=30, l=70, r=40), violingap=0)
     return fig
 
 
-def write_combined_html(fig_bar, fig_violin, out_file, page_title):
+def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label):
+    rows = len(pairs)
+    cols = 1
+    
+    gap_px = 60
+    S_PAIR_H = 800
+    total_plot_height = rows * S_PAIR_H + (rows - 1) * gap_px
+
+    subplot_titles = [f"{pair}<br>({time_labels[0]} vs {time_labels[1]})" for pair in pairs]
+
+    fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles,
+                         vertical_spacing=vspacing(rows, 0.05))
+
+    for p, pair in enumerate(pairs):
+        r = p + 1
+        t_col_1 = time_cols[0]
+        
+        sub = df.loc[df["pair"] == pair, [t_col_1, "time"]].dropna()
+        sub = sub[(sub["time"] <= 100) & (sub['time'] >= 0)].copy()
+
+        if sub.empty:
+            continue
+            
+        dt1 = pd.to_datetime(sub[t_col_1])
+        
+        # Convert to continuous hours (0-24)
+        x_vals = dt1.dt.hour + dt1.dt.minute / 60.0 + dt1.dt.second / 3600.0
+        y_vals = sub["time"]
+        
+        fig.add_trace(go.Scattergl(
+            x=x_vals.tolist(), y=y_vals.tolist(),
+            mode='markers',
+            marker=dict(size=4, color="#1B4EF5", opacity=0.4), # amber color
+            name="Bill",
+            hovertemplate=f"Xuất phát ({time_labels[0]}): %{{x:.2f}}h<br>T.gian VC: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>"
+        ), row=r, col=1)
+
+        fig.update_xaxes(title_text=f"Giờ xuất phát ({time_labels[0]})", range=[0, 24], dtick=2, showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
+        fig.update_yaxes(title_text=f"Thời gian VC (h)", rangemode="tozero", showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
+
+    fig.update_layout(
+        title=dict(
+            text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} theo {sort_label} — Scatter: Giờ xuất phát vs Thời gian vận chuyển</sup>",
+            x=0.5, xanchor="center", font=dict(size=15)),
+        height=total_plot_height + 120, width=FIG_WIDTH, showlegend=False,
+        plot_bgcolor="#F9FAFB", paper_bgcolor="#FFFFFF",
+        font=dict(family="Segoe UI, Arial", size=11),
+        margin=dict(t=110, b=30, l=70, r=40))
+    return fig
+
+
+def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title):
+    # os.makedirs(os.path.dirname(out_file), exist_ok=True)
     bar_div    = pio.to_html(fig_bar, full_html=False, include_plotlyjs=False)
     violin_div = pio.to_html(fig_violin, full_html=False, include_plotlyjs=False)
+    scatter_div = pio.to_html(fig_scatter, full_html=False, include_plotlyjs=False)
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
 <meta charset="utf-8"><title>{page_title}</title>
 <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
 <style>
-  body {{ font-family:'Segoe UI',Arial,sans-serif; background:#fff; margin:0; padding:16px; }}
-  h2   {{ color:#1e3a5f; border-bottom:2px solid #2563EB; padding-bottom:6px; margin:0 0 4px; }}
-  hr   {{ border:none; border-top:1px solid #E5E7EB; margin:8px 0; }}
+  body {{ font-family:'Segoe UI',Arial,sans-serif; background:#f4f6f9; margin:0; padding:20px; }}
+  h2   {{ color:#1e3a5f; margin: 0 0 16px; font-weight: 600; }}
+  
+  .tabs {{
+    display: flex;
+    border-bottom: 2px solid #e2e8f0;
+    margin-bottom: 20px;
+    background: #fff;
+    border-radius: 8px 8px 0 0;
+    overflow: hidden;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+  }}
+  .tab-btn {{
+    background: inherit;
+    border: none;
+    outline: none;
+    cursor: pointer;
+    padding: 16px 32px;
+    font-size: 16px;
+    font-weight: 600;
+    color: #64748b;
+    transition: all 0.2s ease;
+    border-bottom: 3px solid transparent;
+  }}
+  .tab-btn:hover {{ background-color: #f8fafc; color: #334155; }}
+  .tab-btn.active {{ color: #2563EB; border-bottom: 3px solid #2563EB; background: #fff; }}
+  
+  .tabcontent {{
+    display: none;
+    background: #fff;
+    padding: 20px;
+    border-radius: 0 0 8px 8px;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+    animation: fadeEffect 0.4s;
+  }}
+  @keyframes fadeEffect {{ from {{opacity: 0;}} to {{opacity: 1;}} }}
 </style>
 </head>
 <body>
-  <h2>Phân phối thời gian vận chuyển (Bar chart)</h2>
-  {bar_div}
-  <hr>
-  <h2>Giờ tại kho 1A vs Thời gian vận chuyển (Violin plot)</h2>
-  {violin_div}
+  <h2>{page_title}</h2>
+  
+  <div class="tabs">
+    <button class="tab-btn active" onclick="openTab(event, 'BarChart')">Phân phối (Bar Chart)</button>
+    <button class="tab-btn" onclick="openTab(event, 'ViolinPlot')">Tương quan (Violin Plot)</button>
+    <button class="tab-btn" onclick="openTab(event, 'ScatterPlot')">Phân tán (Scatter Plot)</button>
+  </div>
+
+  <div id="BarChart" class="tabcontent" style="display:block;">
+    {bar_div}
+  </div>
+
+  <div id="ViolinPlot" class="tabcontent">
+    {violin_div}
+  </div>
+
+  <div id="ScatterPlot" class="tabcontent">
+    {scatter_div}
+  </div>
+
+  <script>
+  function openTab(evt, tabName) {{
+    var i, tabcontent, tablinks;
+    tabcontent = document.getElementsByClassName("tabcontent");
+    for (i = 0; i < tabcontent.length; i++) {{ tabcontent[i].style.display = "none"; }}
+    
+    tablinks = document.getElementsByClassName("tab-btn");
+    for (i = 0; i < tablinks.length; i++) {{ tablinks[i].className = tablinks[i].className.replace(" active", ""); }}
+    
+    document.getElementById(tabName).style.display = "block";
+    evt.currentTarget.className += " active";
+    
+    // Resize plotly to fix hidden rendering issue
+    window.dispatchEvent(new Event('resize'));
+  }}
+  </script>
 </body>
 </html>"""
     with open(out_file, "w", encoding="utf-8") as f:
@@ -218,10 +429,10 @@ def write_combined_html(fig_bar, fig_violin, out_file, page_title):
     print(f"  ==> {out_file}")
 
 
-def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_col=None):
+def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None):
     required = {col_a, col_b, "bill_code", wt_col, "time"}
-    if time_col:
-        required.add(time_col)
+    if time_cols:
+        required.update(time_cols)
     validate_columns(df, required, out_file)
 
     df, top = top_pairs(df, col_a, col_b, sort_by, wt_col)
@@ -232,9 +443,10 @@ def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_
         return
 
     fig_bar = build_bar_fig(df, pairs, top, sort_label, title_prefix)
-    if time_col:
-        fig_violin = build_violin_fig(df, pairs, time_col, title_prefix, sort_label)
-        write_combined_html(fig_bar, fig_violin, out_file, f"{title_prefix} – Top {N_TOP} {sort_label}")
+    if time_cols:
+        fig_violin = build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label)
+        fig_scatter = build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label)
+        write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, f"{title_prefix} – Top {N_TOP} {sort_label}")
     else:
         fig_bar.write_html(out_file, include_plotlyjs="cdn")
         print(f"  ==> {out_file}")
@@ -249,14 +461,18 @@ if __name__ == "__main__":
 
     print("\nVẽ top 10 cặp kho NHIỀU BILL nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "bill_count", "Kho gửi → Kho 1A nguồn",
-              os.path.join(OUTPUT_DIR, "top10_bill_origin.html"), time_col="time_o1a")
+              os.path.join(OUTPUT_DIR, "top10_bill_origin.html"), 
+              time_cols=["time_o", "time_o1a"], time_labels=["Giờ đến Kho đầu", "Giờ đến Kho 1A"])
     build_all(df_d, "kho_d1a", "kho_d", "bill_count", "Kho 1A đích → Kho nhận",
-              os.path.join(OUTPUT_DIR, "top10_bill_dest.html"), time_col="time_d1a")
+              os.path.join(OUTPUT_DIR, "top10_bill_dest.html"), 
+              time_cols=["time_d1a", "time_d"], time_labels=["Giờ đến Kho 1A", "Giờ đến Kho đích"])
 
     print("\nVẽ top 10 cặp kho NHIỀU KG nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "total_kg", "Kho gửi → Kho 1A nguồn",
-              os.path.join(OUTPUT_DIR, "top10_kg_origin.html"), time_col="time_o1a")
+              os.path.join(OUTPUT_DIR, "top10_kg_origin.html"), 
+              time_cols=["time_o", "time_o1a"], time_labels=["Giờ đến Kho đầu", "Giờ đến Kho 1A"])
     build_all(df_d, "kho_d1a", "kho_d", "total_kg", "Kho 1A đích → Kho nhận",
-              os.path.join(OUTPUT_DIR, "top10_kg_dest.html"), time_col="time_d1a")
+              os.path.join(OUTPUT_DIR, "top10_kg_dest.html"), 
+              time_cols=["time_d1a", "time_d"], time_labels=["Giờ đến Kho 1A", "Giờ đến Kho đích"])
 
     print("\nXong! 4 file HTML (bar + violin) đã được lưu.")
