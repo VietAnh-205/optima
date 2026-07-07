@@ -353,13 +353,13 @@ def main():
     stats, fl_df = step6_first_last_stats(traces, bill)
 
     # 7. Tổng hợp
-    step7_summary(stats)
+    # step7_summary(stats)
 
     # 8. Heatmap
     # step8_heatmap(matrix_pct, matrix_count, stats, trunk_set)
 
     # 9. Bar chart
-    step9_top_routes_bar(stats)
+    # step9_top_routes_bar(stats)
 
     # 10. Sankey
     # step10_sankey(stats)

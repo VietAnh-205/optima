@@ -13,7 +13,7 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 def load_data(traces, warehouse, bill): 
     wh = pd.read_csv(warehouse)
-    wh_prov = wh.set_index('name')['province_name'].to_dict() 
+    wh_prov = wh.set_index('name')['province'].to_dict() 
     
     chunks = []
     traces_reader = pd.read_csv(traces, chunksize= CHUNKSIZE) 

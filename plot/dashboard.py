@@ -21,7 +21,7 @@ def strip_timestamps(route_str):
     """Remove -ArrTime-DepTime from each node in a route string."""
     return re.sub(r'-\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}', '', str(route_str))
 
-OUTPUT_DIR = "output_routes"
+OUTPUT_DIR = "output_plot"
 ps = pd.read_csv(os.path.join(OUTPUT_DIR, "pair_stats.csv"))
 rd = pd.read_csv(os.path.join(OUTPUT_DIR, "route_distribution.csv"))
 
