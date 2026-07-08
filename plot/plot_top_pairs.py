@@ -3,6 +3,8 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 import pandas as pd
+import numpy as np
+from scipy import stats
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
@@ -44,13 +46,33 @@ def validate_columns(df, required, name):
         raise ValueError(f"[{name}] Thiếu cột: {sorted(missing)}. Hiện có: {list(df.columns)}")
 
 
-def top_pairs(df, col_a, col_b, sort_by, wt_col):
+def top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow=False, buu_cuc_set=None):
     df = df.copy()
     df["pair"] = df[col_a].astype(str) + " → " + df[col_b].astype(str)
-    agg = (df.groupby("pair")
+    
+    check_col = col_b if is_dest_flow else col_a
+    key = "so_bill" if sort_by == "bill_count" else "tong_kg"
+    
+    if buu_cuc_set is not None:
+        is_bc = df[check_col].fillna("").astype(str).str.strip().isin(buu_cuc_set)
+        df.loc[is_bc, "pair"] = df.loc[is_bc, "pair"] + " [Bưu Cục]"
+        df.loc[~is_bc, "pair"] = df.loc[~is_bc, "pair"] + " [Thường]"
+        
+        agg = (df.groupby(["pair", check_col])
+                 .agg(so_bill=("bill_code", "nunique"), tong_kg=(wt_col, "sum"))
+                 .reset_index())
+                 
+        agg_bc = agg[agg[check_col].fillna("").astype(str).str.strip().isin(buu_cuc_set)]
+        agg_non = agg[~agg[check_col].fillna("").astype(str).str.strip().isin(buu_cuc_set)]
+        
+        top_bc = agg_bc.nlargest(10, key)
+        top_non = agg_non.nlargest(10, key)
+        return df, pd.concat([top_bc, top_non]).reset_index(drop=True)
+        
+    agg = (df.groupby(["pair", check_col])
              .agg(so_bill=("bill_code", "nunique"), tong_kg=(wt_col, "sum"))
              .reset_index())
-    key = "so_bill" if sort_by == "bill_count" else "tong_kg"
+             
     return df, agg.nlargest(N_TOP, key)
 
 
@@ -290,13 +312,13 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
     cols = 1
     
     gap_px = 60
-    S_PAIR_H = 800
+    S_PAIR_H = 400
     total_plot_height = rows * S_PAIR_H + (rows - 1) * gap_px
 
     subplot_titles = [f"{pair}<br>({time_labels[0]} vs {time_labels[1]})" for pair in pairs]
 
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles,
-                         vertical_spacing=vspacing(rows, 0.05))
+                         vertical_spacing=vspacing(rows, 0.015))
 
     for p, pair in enumerate(pairs):
         r = p + 1
@@ -314,13 +336,80 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
         x_vals = dt1.dt.hour + dt1.dt.minute / 60.0 + dt1.dt.second / 3600.0
         y_vals = sub["time"]
         
-        fig.add_trace(go.Scattergl(
-            x=x_vals.tolist(), y=y_vals.tolist(),
+        # Calculate Regression line & Confidence Band on FULL data
+        n = len(x_vals)
+        if n > 2:
+            x_arr = x_vals.values if isinstance(x_vals, pd.Series) else np.array(x_vals)
+            y_arr = y_vals.values if isinstance(y_vals, pd.Series) else np.array(y_vals)
+            
+            try:
+                p_coef, cov = np.polyfit(x_arr, y_arr, 1, cov=True)
+                m, c = p_coef
+                
+                x_line = np.linspace(x_arr.min(), x_arr.max(), 100)
+                y_line = m * x_line + c
+                
+                y_err = y_arr - (m * x_arr + c)
+                dof = n - 2
+                s_err = np.sqrt(np.sum(y_err**2) / max(dof, 1))
+                t_val = stats.t.ppf(0.975, max(dof, 1))
+                
+                mean_x = np.mean(x_arr)
+                ss_x = np.sum((x_arr - mean_x)**2)
+                
+                # Prediction Interval Band (captures the spread of data points)
+                pi = t_val * s_err * np.sqrt(1 + 1/n + (x_line - mean_x)**2 / max(ss_x, 1e-6))
+                y_upper = y_line + pi
+                y_lower = y_line - pi
+                
+                # Plot PI Band FIRST (so it sits behind markers)
+                x_ci = np.concatenate([x_line, x_line[::-1]]).tolist()
+                y_ci = np.concatenate([y_upper, y_lower[::-1]]).tolist()
+                fig.add_trace(go.Scatter(
+                    x=x_ci,
+                    y=y_ci,
+                    fill='toself',
+                    fillcolor='rgba(239, 68, 68, 0.2)',
+                    line=dict(color='rgba(255,255,255,0)'),
+                    hoverinfo="skip",
+                    showlegend=False,
+                    name="95% PI"
+
+                ), row=r, col=1)
+                
+            except Exception as e:
+                print(f"  !! Cannot plot regression for {pair}: {e}")
+                x_line, y_line = None, None
+        else:
+            x_line, y_line = None, None
+
+        # Downsample scatter points for rendering if too many
+        if len(x_vals) > 10000:
+            sample_idx = sub.sample(10000, random_state=42).index
+            x_plot = x_vals.loc[sample_idx]
+            y_plot = y_vals.loc[sample_idx]
+        else:
+            x_plot = x_vals
+            y_plot = y_vals
+
+        # Plot Scatter markers using standard Scatter (not Scattergl) to avoid WebGL overlap bugs
+        fig.add_trace(go.Scatter(
+            x=x_plot.tolist(), y=y_plot.tolist(),
             mode='markers',
             marker=dict(size=4, color="#1B4EF5", opacity=0.4), # amber color
             name="Bill",
             hovertemplate=f"Xuất phát ({time_labels[0]}): %{{x:.2f}}h<br>T.gian VC: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>"
         ), row=r, col=1)
+
+        # Plot Trend Line on top of everything
+        if x_line is not None:
+            fig.add_trace(go.Scatter(
+                x=x_line.tolist(), y=y_line.tolist(),
+                mode='lines',
+                line=dict(color='red', width=2),
+                name="Trend",
+                hovertemplate="Xuất phát: %{x:.2f}h<br>T.gian VC (dự báo): %{y:.1f}h<extra></extra>"
+            ), row=r, col=1)
 
         fig.update_xaxes(title_text=f"Giờ xuất phát ({time_labels[0]})", range=[0, 24], dtick=2, showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
         fig.update_yaxes(title_text=f"Thời gian VC (h)", rangemode="tozero", showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
@@ -337,7 +426,7 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
 
 
 def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title):
-    # os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    os.makedirs(os.path.dirname(out_file), exist_ok=True)
     bar_div    = pio.to_html(fig_bar, full_html=False, include_plotlyjs=False)
     violin_div = pio.to_html(fig_violin, full_html=False, include_plotlyjs=False)
     scatter_div = pio.to_html(fig_scatter, full_html=False, include_plotlyjs=False)
@@ -429,13 +518,13 @@ def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title):
     print(f"  ==> {out_file}")
 
 
-def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None):
+def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None, is_dest_flow=False, buu_cuc_set=None):
     required = {col_a, col_b, "bill_code", wt_col, "time"}
     if time_cols:
         required.update(time_cols)
     validate_columns(df, required, out_file)
 
-    df, top = top_pairs(df, col_a, col_b, sort_by, wt_col)
+    df, top = top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow, buu_cuc_set)
     sort_label = "Số bill" if sort_by == "bill_count" else "Tổng kg"
     pairs = top["pair"].tolist()
     if not pairs:
@@ -453,26 +542,35 @@ def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_
 
 
 if __name__ == "__main__":
+    print("Đọc dữ liệu kho...")
+    wh_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "warehouse.csv")
+    wh_df = pd.read_csv(wh_path)
+    buu_cuc_set = set(wh_df[wh_df['Bưu Cục'] == 'Y']['name'].dropna().str.strip())
+
     print("Đọc dữ liệu...")
     df_o = pd.read_csv(os.path.join(INPUT_DIR, "origin_to_1A.csv"))
     df_d = pd.read_csv(os.path.join(INPUT_DIR, "1A_to_destination.csv"))
     print(f"  origin_to_1A : {len(df_o):,} bill")
     print(f"  1A_to_dest   : {len(df_d):,} bill")
 
-    print("\nVẽ top 10 cặp kho NHIỀU BILL nhất...")
+    print("\nVẽ top 20 cặp kho (10 bưu cục + 10 không phải bưu cục) NHIỀU BILL nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "bill_count", "Kho gửi → Kho 1A nguồn",
-              os.path.join(OUTPUT_DIR, "top10_bill_origin.html"), 
-              time_cols=["time_o", "time_o1a"], time_labels=["Giờ đến Kho đầu", "Giờ đến Kho 1A"])
+              os.path.join(OUTPUT_DIR, "top20_bill_origin.html"), 
+              time_cols=["time_o", "time_o1a"], time_labels=["Giờ đến Kho đầu", "Giờ đến Kho 1A"],
+              is_dest_flow=False, buu_cuc_set=buu_cuc_set)
     build_all(df_d, "kho_d1a", "kho_d", "bill_count", "Kho 1A đích → Kho nhận",
-              os.path.join(OUTPUT_DIR, "top10_bill_dest.html"), 
-              time_cols=["time_d1a", "time_d"], time_labels=["Giờ đến Kho 1A", "Giờ đến Kho đích"])
+              os.path.join(OUTPUT_DIR, "top20_bill_dest.html"), 
+              time_cols=["time_d1a", "time_d"], time_labels=["Giờ đến Kho 1A", "Giờ đến Kho đích"],
+              is_dest_flow=True, buu_cuc_set=buu_cuc_set)
 
-    print("\nVẽ top 10 cặp kho NHIỀU KG nhất...")
+    print("\nVẽ top 20 cặp kho (10 bưu cục + 10 không phải bưu cục) NHIỀU KG nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "total_kg", "Kho gửi → Kho 1A nguồn",
-              os.path.join(OUTPUT_DIR, "top10_kg_origin.html"), 
-              time_cols=["time_o", "time_o1a"], time_labels=["Giờ đến Kho đầu", "Giờ đến Kho 1A"])
+              os.path.join(OUTPUT_DIR, "top20_kg_origin.html"), 
+              time_cols=["time_o", "time_o1a"], time_labels=["Giờ đến Kho đầu", "Giờ đến Kho 1A"],
+              is_dest_flow=False, buu_cuc_set=buu_cuc_set)
     build_all(df_d, "kho_d1a", "kho_d", "total_kg", "Kho 1A đích → Kho nhận",
-              os.path.join(OUTPUT_DIR, "top10_kg_dest.html"), 
-              time_cols=["time_d1a", "time_d"], time_labels=["Giờ đến Kho 1A", "Giờ đến Kho đích"])
+              os.path.join(OUTPUT_DIR, "top20_kg_dest.html"), 
+              time_cols=["time_d1a", "time_d"], time_labels=["Giờ đến Kho 1A", "Giờ đến Kho đích"],
+              is_dest_flow=True, buu_cuc_set=buu_cuc_set)
 
-    print("\nXong! 4 file HTML (bar + violin) đã được lưu.")
+    print("\nXong! 4 file HTML (bar + violin + scatter) đã được lưu.")

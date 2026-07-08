@@ -18,21 +18,33 @@ sche = sche.sort_values(['bill_code', 'io_time']).reset_index(drop=True)
 
 
 sche['pre_wh'] = sche.groupby('bill_code')['warehouse_name'].shift(1) 
-sche_unique = sche[sche['warehouse_name'] != sche['pre_wh']].copy() 
-sche_unique['wh_rank'] = sche_unique.groupby('bill_code').cumcount() 
+sche['next_wh'] = sche.groupby('bill_code')['warehouse_name'].shift(-1) 
 
-sche_1a = sche_unique[sche_unique['warehouse_name'].isin(set_1a)] 
+sche_first = sche[sche['warehouse_name'] != sche['pre_wh']].copy() 
+sche_last = sche[sche['warehouse_name'] != sche['next_wh']].copy() 
+
+sche_first['wh_rank'] = sche_first.groupby('bill_code').cumcount() 
+sche_last['wh_rank'] = sche_last.groupby('bill_code').cumcount() 
+
+sche_1a = sche_first[sche_first['warehouse_name'].isin(set_1a)] 
 count_1a = sche_1a.groupby('bill_code').size().reset_index(name = 'count_1a') 
 count_1a = count_1a[count_1a['count_1a'] >= 2] 
-sche_unique = sche_unique[sche_unique['bill_code'].isin(set(count_1a['bill_code']))]
-max_rank = sche_unique.groupby('bill_code')['wh_rank'].transform('max') 
-sche_unique['wh_rank_rev'] = max_rank - sche_unique['wh_rank'] 
-sche_unique = sche_unique.merge(bill, on = 'bill_code', how = 'inner')
+valid_bills = set(count_1a['bill_code'])
 
-wh_o = (sche_unique[sche_unique['wh_rank'] == 0][['bill_code', 'warehouse_name', 'io_time']].rename(columns = {'warehouse_name': 'kho_o', 'io_time': 'time_o'})) 
-wh_o1a = (sche_unique[sche_unique['wh_rank'] == 1][['bill_code', 'warehouse_name', 'io_time', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_o1a', 'io_time': 'time_o1a'}))
-wh_d = (sche_unique[sche_unique['wh_rank_rev'] == 0][['bill_code', 'warehouse_name', 'io_time']].rename(columns = {'warehouse_name': 'kho_d', 'io_time': 'time_d'})) 
-wh_d1a = (sche_unique[sche_unique['wh_rank_rev'] == 1][['bill_code', 'warehouse_name', 'io_time', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_d1a', 'io_time': 'time_d1a'})) 
+sche_first = sche_first[sche_first['bill_code'].isin(valid_bills)]
+max_rank_first = sche_first.groupby('bill_code')['wh_rank'].transform('max') 
+sche_first['wh_rank_rev'] = max_rank_first - sche_first['wh_rank'] 
+sche_first = sche_first.merge(bill, on = 'bill_code', how = 'inner')
+
+sche_last = sche_last[sche_last['bill_code'].isin(valid_bills)]
+max_rank_last = sche_last.groupby('bill_code')['wh_rank'].transform('max') 
+sche_last['wh_rank_rev'] = max_rank_last - sche_last['wh_rank'] 
+sche_last = sche_last.merge(bill, on = 'bill_code', how = 'inner')
+
+wh_o = (sche_last[sche_last['wh_rank'] == 0][['bill_code', 'warehouse_name', 'io_time']].rename(columns = {'warehouse_name': 'kho_o', 'io_time': 'time_o'})) 
+wh_o1a = (sche_first[sche_first['wh_rank'] == 1][['bill_code', 'warehouse_name', 'io_time', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_o1a', 'io_time': 'time_o1a'}))
+wh_d = (sche_first[sche_first['wh_rank_rev'] == 0][['bill_code', 'warehouse_name', 'io_time']].rename(columns = {'warehouse_name': 'kho_d', 'io_time': 'time_d'})) 
+wh_d1a = (sche_last[sche_last['wh_rank_rev'] == 1][['bill_code', 'warehouse_name', 'io_time', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_d1a', 'io_time': 'time_d1a'})) 
 
 pair_o = (wh_o.merge(wh_o1a, on = 'bill_code', how = 'inner'))
 pair_d = (wh_d1a.merge(wh_d, on = 'bill_code', how = 'inner')) 

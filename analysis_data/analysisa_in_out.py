@@ -48,8 +48,8 @@ df_d_filter = pd.merge(df_d, valid_visits_d1a[['bill_code', 'warehouse_name', 'v
 df_o_filter = df_o_filter.rename(columns={'visit_in_time': 'time_1a_in', 'visit_out_time': 'time_1a_out'})
 df_d_filter = df_d_filter.rename(columns={'visit_in_time': 'time_1a_in', 'visit_out_time': 'time_1a_out'})
 
-df_o_filter.to_csv(os.path.join('output_all_traces', 'origin_to_1A_filter.csv'), index = False) 
-df_d_filter.to_csv(os.path.join('output_all_traces', '1A_to_destination_filter.csv'), index = False)
+df_o_filter.to_csv(os.path.join('output_all_traces', 'origin_inout_1a.csv'), index = False) 
+df_d_filter.to_csv(os.path.join('output_all_traces', 'destination_inout_1a.csv'), index = False)
 
 print(f"size of o_filter.csv: {df_o_filter.shape}") 
 print(f"size of d_filter.csv: {df_d_filter.shape}")
