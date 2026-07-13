@@ -8,6 +8,7 @@ from scipy import stats
 import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
+from sklearn.tree import DecisionTreeRegressor
 
 INPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_all_traces")
 OUTPUT_DIR = 'output_plot'
@@ -16,7 +17,32 @@ LABELS = ["0-1h","1-2h","2-3h","3-4h","4-5h","5-6h","6-8h","8-10h","10-12h",
           "12-18h","18-24h","24-36h","36-48h","48-72h","72-120h",">120h"]
 
 BAR_COLOR, VIOLIN_COLOR = "#2563EB", "#1D4ED8"
-N_TOP     = 10   # chỉ giữ top 10 kho bưu cục
+N_TOP     = 10
+
+# Bảng màu cho phân cụm scatter theo nhãn (tối đa ~20 loại)
+CATEGORY_COLORS = [
+    "#2563EB",  # xanh dương
+    "#E11D48",  # đỏ hồng
+    "#10B981",  # xanh lá
+    "#F59E0B",  # vàng cam
+    "#8B5CF6",  # tím
+    "#06B6D4",  # cyan
+    "#F97316",  # cam
+    "#EC4899",  # hồng
+    "#14B8A6",  # teal
+    "#84CC16",  # lime
+    "#6366F1",  # indigo
+    "#EF4444",  # đỏ
+    "#A855F7",  # purple
+    "#0EA5E9",  # sky
+    "#D946EF",  # fuchsia
+    "#22C55E",  # green
+    "#FBBF24",  # amber
+    "#64748B",  # slate
+    "#78716C",  # stone
+    "#FB923C",  # orange light
+]
+
 FIG_WIDTH = 1400 
 BAR_ROW_H = 1000
 
@@ -24,6 +50,20 @@ BAR_ROW_H = 1000
 V_COLS, V_ROWS_PER_PAIR = 2, 1
 V_ROW_H = 600  # Chiều cao cho mỗi subplot (giảm so với trước)
 
+EXCLUDED_KHO = [
+    "Kho TGDĐ Bảo Hành",
+    "Kho Hà Tĩnh",
+    "Kho Kiến An",
+    "Kho Thường Tín",
+    "Kho Amway",
+    "Kho Digiworld",
+    "Kho Thái Nguyên",
+    "Kho Việt Trì",
+    "Kho Ninh Hòa",
+    "Kho An Giang",
+    "Bưu cục Dự Án Vgreen Sóng Thần",
+    "Bưu cục Dự Án Vgreen Văn Giang"
+]
 
 # ── Helpers dùng chung ────────────────────────────────────────────────
 def find_optimal_shift(time_series):
@@ -59,6 +99,13 @@ def validate_columns(df, required, name):
 
 def top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow=False, buu_cuc_set=None):
     df = df.copy()
+    
+    # # Lọc bỏ các kho trong danh sách bị loại trừ
+    # df = df[~df[col_a].isin(EXCLUDED_KHO) & ~df[col_b].isin(EXCLUDED_KHO)].copy()
+    if is_dest_flow: 
+        df = df[~df[col_b].isin(EXCLUDED_KHO)] 
+    else: 
+        df = df[~df[col_a].isin(EXCLUDED_KHO)]
     df["pair"] = df[col_a].astype(str) + " → " + df[col_b].astype(str)
     
     check_col = col_b if is_dest_flow else col_a
@@ -97,8 +144,10 @@ def axref(ax, axis="x", suffix=""):
 # ── Figure 1: Bar chart (mỗi cặp kho = 1 hàng) ──────────────────────────
 def build_bar_fig(df, pairs, top, sort_label, title_prefix):
     rows = len(pairs)
+    gap_px = 60
+    total_plot_height = BAR_ROW_H * rows + (rows - 1) * gap_px
     fig = make_subplots(rows=rows, cols=1, subplot_titles=pairs,
-                         vertical_spacing=vspacing(rows, 0.01))
+                         vertical_spacing=gap_px / max(total_plot_height, 1))
 
     for idx, pair in enumerate(pairs):
         r = ax = idx + 1
@@ -160,10 +209,9 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
     rows = len(pairs)
     cols = 2
 
-    gap_px = 30
-    V_PAIR_H = 1200  # giảm resolution so với bản gốc (trước đây 3000/cặp)
-    total_plot_height = rows * V_PAIR_H + max(rows - 1, 0) * gap_px
-
+    V_ROW_H = 600
+    gap_px = 80
+    total_plot_height = rows * V_ROW_H + (rows - 1) * gap_px
     specs = [[{"type": "xy"}, {"type": "xy"}] for _ in pairs]
 
     subplot_titles = []
@@ -171,8 +219,9 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
         subplot_titles.append(f"{pair}<br>({time_labels[0]} vs T.gian VC)")
         subplot_titles.append(f"{pair}<br>Tương quan: {time_labels[1]} theo {time_labels[0]}")
 
+    # Create subplots
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles,
-                         vertical_spacing=vspacing(rows, 0.02),
+                         vertical_spacing=gap_px / max(total_plot_height, 1),
                          horizontal_spacing=0.06, specs=specs)
 
     VIOLIN_COLORS = ["#10B981", "#1D4ED8"]
@@ -208,6 +257,8 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
             for h in shifted_order:
                 h_next = (h + 1) % 24
                 x_vals = sub.loc[sub["hour"] == h, "time"].values
+                if len(x_vals) > 500:
+                    x_vals = np.random.choice(x_vals, 500, replace=False)
                 label, count_h, pct_h = stats_left[h]
 
                 if len(x_vals) < 2:
@@ -268,6 +319,8 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
             for h in shifted_order:
                 h_next = (h + 1) % 24
                 x_vals = sub2_raw.loc[sub2_raw["hour_1"] == h, "hour_2_cont"].values
+                if len(x_vals) > 500:
+                    x_vals = np.random.choice(x_vals, 500, replace=False)
                 label = stats_right[h][0]
 
                 if len(x_vals) < 2:
@@ -292,292 +345,314 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
         title=dict(
             text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} kho bưu cục theo {sort_label} — Violin: phân phối T.gian VC & tương quan giờ đến</sup>",
             x=0.5, xanchor="center", font=dict(size=15)),
-        height=total_plot_height + 120, width=FIG_WIDTH, showlegend=False,
+        height=total_plot_height + 300, width=FIG_WIDTH , showlegend=False,
         plot_bgcolor="#F9FAFB", paper_bgcolor="#FFFFFF",
         font=dict(family="Segoe UI, Arial", size=11),
         margin=dict(t=110, b=30, l=70, r=40), violingap=0)
     return fig
 
-
-def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts):
-    rows = len(pairs)
-    cols = 1
+def add_dt_regression_traces(fig, r, c, x_vals, y_vals, hour_shift):
+    """Tính toán và vẽ đường hồi quy Step Function bằng Decision Tree"""
+    if len(x_vals) < 10:
+        return
+        
+    x_arr = x_vals.values if isinstance(x_vals, pd.Series) else np.array(x_vals)
+    y_arr = y_vals.values if isinstance(y_vals, pd.Series) else np.array(y_vals)
     
-    gap_px = 60
-    S_PAIR_H = 400
-    total_plot_height = rows * S_PAIR_H + (rows - 1) * gap_px
+    try:
+        # Giới hạn độ sâu để không bị nhiễu (Overfit). max_depth=4 ~ tối đa 16 bậc
+        # min_samples_leaf=0.05 đảm bảo mỗi luồng chứa ít nhất 5% lượng bill
+        dt = DecisionTreeRegressor(max_depth=4, min_samples_leaf=0.05, random_state=42)
+        X_train = x_arr.reshape(-1, 1)
+        dt.fit(X_train, y_arr)
+        
+        # Sinh các điểm trên trục X để vẽ (tăng độ mịn để nét bậc thang sắc nét)
+        x_line = np.linspace(x_arr.min(), x_arr.max(), 300)
+        X_test = x_line.reshape(-1, 1)
+        y_line = dt.predict(X_test)
+        
+        real_x_line = (x_line + hour_shift) % 24
+        
+        # Tính độ lệch chuẩn (std) cho từng cụm (leaf node) để vẽ dải PI
+        leaves_train = dt.apply(X_train)
+        leaf_std = {}
+        for leaf_idx in np.unique(leaves_train):
+            std_val = np.std(y_arr[leaves_train == leaf_idx])
+            leaf_std[leaf_idx] = max(std_val, 1e-6)
+            
+        leaves_test = dt.apply(X_test)
+        std_line = np.array([leaf_std[idx] for idx in leaves_test])
+        
+        y_upper = y_line + 1.96 * std_line
+        y_lower = y_line - 1.96 * std_line
+        
+        x_ci = np.concatenate([x_line, x_line[::-1]]).tolist()
+        y_ci = np.concatenate([y_upper, y_lower[::-1]]).tolist()
+        
+        # Vẽ dải PI (Prediction Interval)
+        fig.add_trace(go.Scatter(
+            x=x_ci, y=y_ci, fill='toself', fillcolor='rgba(239, 68, 68, 0.15)',
+            line=dict(color='rgba(255,255,255,0)'), hoverinfo="skip", showlegend=False, name=f"PI"
+        ), row=r, col=c)
+        
+        # Vẽ đường Step Function
+        fig.add_trace(go.Scatter(
+            x=x_line.tolist(), y=y_line.tolist(),
+            customdata=real_x_line.tolist(),
+            mode='lines', line=dict(color='#EF4444', width=3, shape='vh'),
+            name=f"Trend (Cut-off)", showlegend=False,
+            hovertemplate="Trục X (thực tế): %{customdata:.2f}h<br>Dự báo (Y): %{y:.1f}<extra></extra>"
+        ), row=r, col=c)
+                    
+    except Exception as e:
+        print(f"  !! Lỗi vẽ DT regression (row={r}, col={c}): {e}")
 
-    subplot_titles = [f"{pair}<br>({time_labels[0]} vs {time_labels[1]})" for pair in pairs]
+def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts, pair_shifts2, color_col=None):
+    """
+    Scatter plot với tùy chọn tô màu theo nhãn phân loại (color_col).
+    Nếu color_col được truyền vào (VD: 'VD_type'), mỗi giá trị sẽ có 1 màu riêng.
+    """
+    rows = len(pairs)
+    cols = 2
+    
+    ROW_H = 600
+    gap_px = 80
+    total_plot_height = rows * ROW_H + (rows - 1) * gap_px
+
+    subplot_titles = []
+    for pair in pairs:
+        subplot_titles.append(f"{pair}<br>({time_labels[1]} vs T.gian VC)")
+        subplot_titles.append(f"{pair}<br>({time_labels[0]} vs Giờ đến)")
 
     fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles,
-                         vertical_spacing=vspacing(rows, 0.02))
+                         vertical_spacing=gap_px / max(total_plot_height, 1))
+
+    # --- Xây dựng bảng màu cho color_col ---
+    cat_color_map = {}
+    if color_col and color_col in df.columns:
+        # Lấy top categories theo tần suất, còn lại gộp vào "Khác"
+        cat_counts = df[color_col].fillna("N/A").value_counts()
+        max_cats = len(CATEGORY_COLORS) - 1  # dành 1 slot cho "Khác"
+        top_cats = cat_counts.head(max_cats).index.tolist()
+        for i, cat in enumerate(top_cats):
+            cat_color_map[cat] = CATEGORY_COLORS[i]
+        cat_color_map["Khác"] = CATEGORY_COLORS[max_cats]
+    
+    # Theo dõi legend đã hiện chưa (chỉ hiện 1 lần cho toàn bộ figure)
+    legend_shown = set()
 
     for p, pair in enumerate(pairs):
         r = p + 1
         t_col_1 = time_cols[0]
+        t_col_2 = time_cols[1]
         
-        sub = df.loc[df["pair"] == pair, [t_col_1, "time"]].dropna()
-        sub = sub[(sub["time"] <= 100) & (sub['time'] >= 0)].copy()
-
-        if sub.empty:
-            continue
-            
-        dt1 = pd.to_datetime(sub[t_col_1])
-        
-        # Shift giờ xuất phát theo hour_shift của cặp
         hour_shift = pair_shifts.get(pair, 0)
-        raw_hours = dt1.dt.hour + dt1.dt.minute / 60.0 + dt1.dt.second / 3600.0
-        x_vals = (raw_hours - hour_shift) % 24
-        y_vals = sub["time"]
-        
-        # Calculate Regression line & Confidence Band on FULL data
-        n = len(x_vals)
-        if n > 2:
-            x_arr = x_vals.values if isinstance(x_vals, pd.Series) else np.array(x_vals)
-            y_arr = y_vals.values if isinstance(y_vals, pd.Series) else np.array(y_vals)
+        hour_shift2 = pair_shifts2.get(pair, 0)
+
+        # --- CỘT 1 (Trái): X = Giờ đến (shifted), Y = Thời gian vận chuyển ---
+        needed_cols_3 = [t_col_2, "time"]
+        if color_col and color_col in df.columns:
+            needed_cols_3.append(color_col)
+        sub3 = df.loc[df["pair"] == pair, needed_cols_3].dropna(subset=[t_col_2, "time"])
+        sub3 = sub3[(sub3["time"] <= 100) & (sub3['time'] >= 0)].copy()
+
+        if not sub3.empty:
+            q1_3 = sub3["time"].quantile(0.1)
+            q3_3 = sub3["time"].quantile(0.9)
+            sub3 = sub3[(sub3["time"] >= q1_3) & (sub3["time"] <= q3_3)].copy()
+
+            if not sub3.empty:
+                dt3 = pd.to_datetime(sub3[t_col_2])
+                sub3["_h_bin"] = dt3.dt.hour
+                total_bills_3 = len(sub3)
+                hour_counts_3 = sub3["_h_bin"].value_counts()
+                valid_hours_3 = hour_counts_3[hour_counts_3 >= 0.01 * total_bills_3].index
+                sub3 = sub3[sub3["_h_bin"].isin(valid_hours_3)].copy()
+                
+            if not sub3.empty:
+                dt3 = pd.to_datetime(sub3[t_col_2])
+                raw_hours3 = dt3.dt.hour + dt3.dt.minute / 60.0 + dt3.dt.second / 3600.0
+                sub3["_x_shifted"] = (raw_hours3 - hour_shift2) % 24
+                x3_vals = sub3["_x_shifted"]
+                y3_vals = sub3["time"]
+                
+                n3 = len(x3_vals)
+                # Vẽ Decision Tree Regression
+                add_dt_regression_traces(fig, r, 1, x3_vals, y3_vals, hour_shift2)
+
+                # Sampling nếu quá nhiều điểm
+                if n3 > 10000:
+                    sample_idx3 = sub3.sample(10000, random_state=42).index
+                    sub3_plot = sub3.loc[sample_idx3]
+                else:
+                    sub3_plot = sub3
+                
+                x3_plot = sub3_plot["_x_shifted"]
+                y3_plot = sub3_plot["time"]
+                real_hours_plot3 = (x3_plot + hour_shift2) % 24
+
+                # --- Vẽ scatter theo phân loại hoặc 1 màu ---
+                if cat_color_map:
+                    sub3_plot = sub3_plot.copy()
+                    sub3_plot["_cat"] = sub3_plot[color_col].fillna("N/A")
+                    sub3_plot.loc[~sub3_plot["_cat"].isin(cat_color_map), "_cat"] = "Khác"
+                    sub3_plot["_real_h"] = real_hours_plot3
+
+                    for cat, c_color in cat_color_map.items():
+                        mask = sub3_plot["_cat"] == cat
+                        if mask.sum() == 0:
+                            continue
+                        show_leg = cat not in legend_shown
+                        legend_shown.add(cat)
+                        fig.add_trace(go.Scatter(
+                            x=sub3_plot.loc[mask, "_x_shifted"].tolist(),
+                            y=sub3_plot.loc[mask, "time"].tolist(),
+                            customdata=sub3_plot.loc[mask, "_real_h"].tolist(),
+                            mode='markers',
+                            marker=dict(size=4, color=c_color, opacity=0.5),
+                            name=cat, legendgroup=cat, showlegend=show_leg,
+                            hovertemplate=(
+                                f"Đến ({time_labels[1]}): %{{customdata:.2f}}h<br>"
+                                f"T.gian VC: %{{y:.1f}}h<br>"
+                                f"{color_col}: {cat}<br>"
+                                f"Cặp: {pair}<extra></extra>"
+                            ),
+                        ), row=r, col=1)
+                else:
+                    fig.add_trace(go.Scatter(
+                        x=x3_plot.tolist(), y=y3_plot.tolist(),
+                        customdata=real_hours_plot3.tolist(),
+                        mode='markers', marker=dict(size=4, color="#10B981", opacity=0.4),
+                        name="Bill", showlegend=False,
+                        hovertemplate=f"Đến ({time_labels[1]}): %{{customdata:.2f}}h<br>T.gian VC: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>"
+                    ), row=r, col=1)
+
+                _tv_s3 = list(range(0, 25, 2))
+                _tt_s3 = [f"{int((v + hour_shift2) % 24)}h" for v in _tv_s3]
+                fig.update_xaxes(title_text=f"Giờ đến ({time_labels[1]})", range=[0, 24], tickvals=_tv_s3, ticktext=_tt_s3, showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
+                fig.update_yaxes(title_text=f"Thời gian VC (h)", rangemode="tozero", showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
+
+        # --- CỘT 2 (Phải): X = Giờ xuất phát, Y = Giờ đến (offset) ---
+        needed_cols_2 = [t_col_1, t_col_2]
+        if color_col and color_col in df.columns:
+            needed_cols_2.append(color_col)
+        sub2 = df.loc[df["pair"] == pair, needed_cols_2].dropna(subset=[t_col_1, t_col_2]).copy()
+        if not sub2.empty:
+            dt1 = pd.to_datetime(sub2[t_col_1])
+            dt2 = pd.to_datetime(sub2[t_col_2])
             
-            try:
-                p_coef, cov = np.polyfit(x_arr, y_arr, 1, cov=True)
-                m, c = p_coef
-                
-                x_line = np.linspace(x_arr.min(), x_arr.max(), 100)
-                y_line = m * x_line + c
-                
-                y_err = y_arr - (m * x_arr + c)
-                dof = n - 2
-                s_err = np.sqrt(np.sum(y_err**2) / max(dof, 1))
-                t_val = stats.t.ppf(0.975, max(dof, 1))
-                
-                mean_x = np.mean(x_arr)
-                ss_x = np.sum((x_arr - mean_x)**2)
-                
-                # Prediction Interval Band (captures the spread of data points)
-                pi = t_val * s_err * np.sqrt(1 + 1/n + (x_line - mean_x)**2 / max(ss_x, 1e-6))
-                y_upper = y_line + pi
-                y_lower = y_line - pi
-                
-                # Plot PI Band FIRST (so it sits behind markers)
-                x_ci = np.concatenate([x_line, x_line[::-1]]).tolist()
-                y_ci = np.concatenate([y_upper, y_lower[::-1]]).tolist()
-                fig.add_trace(go.Scatter(
-                    x=x_ci,
-                    y=y_ci,
-                    fill='toself',
-                    fillcolor='rgba(239, 68, 68, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    hoverinfo="skip",
-                    showlegend=False,
-                    name="95% PI"
+            departure_date = dt1.dt.normalize()
+            y2_vals_raw = (dt2 - departure_date).dt.total_seconds() / 3600.0
+            
+            raw_hours2 = dt1.dt.hour + dt1.dt.minute / 60.0 + dt1.dt.second / 3600.0
+            x2_vals_raw = (raw_hours2 - hour_shift) % 24
+            
+            sub2["x2"] = x2_vals_raw
+            sub2["y2"] = y2_vals_raw
+            
+            sub2 = sub2[(sub2["y2"] >= 0) & (sub2["y2"] <= 36)].copy()
+            
+            if not sub2.empty:
+                q1_2 = sub2["y2"].quantile(0.1)
+                q3_2 = sub2["y2"].quantile(0.9)
+                sub2 = sub2[(sub2["y2"] >= q1_2) & (sub2["y2"] <= q3_2)].copy()
 
-                ), row=r, col=1)
+            if not sub2.empty:
+                sub2["_h_bin"] = pd.to_datetime(sub2[t_col_1]).dt.hour
+                total_bills_2 = len(sub2)
+                hour_counts_2 = sub2["_h_bin"].value_counts()
+                valid_hours_2 = hour_counts_2[hour_counts_2 >= 0.01 * total_bills_2].index
+                sub2 = sub2[sub2["_h_bin"].isin(valid_hours_2)].copy()
+            
+            if not sub2.empty:
+                x2_vals = sub2["x2"]
+                y2_vals = sub2["y2"]
+                n2 = len(x2_vals)
                 
-            except Exception as e:
-                print(f"  !! Cannot plot regression for {pair}: {e}")
-                x_line, y_line = None, None
-        else:
-            x_line, y_line = None, None
+                # Vẽ Decision Tree Regression
+                add_dt_regression_traces(fig, r, 2, x2_vals, y2_vals, hour_shift)
+                
+                # Sampling nếu quá nhiều điểm
+                if n2 > 10000:
+                    sample_idx2 = sub2.sample(10000, random_state=42).index
+                    sub2_plot = sub2.loc[sample_idx2]
+                else:
+                    sub2_plot = sub2
+                
+                x2_plot = sub2_plot["x2"]
+                y2_plot = sub2_plot["y2"]
+                real_hours_plot2 = (x2_plot + hour_shift) % 24
 
-        # Downsample scatter points for rendering if too many
-        if len(x_vals) > 10000:
-            sample_idx = sub.sample(10000, random_state=42).index
-            x_plot = x_vals.loc[sample_idx]
-            y_plot = y_vals.loc[sample_idx]
-        else:
-            x_plot = x_vals
-            y_plot = y_vals
+                # --- Vẽ scatter theo phân loại hoặc 1 màu ---
+                if cat_color_map:
+                    sub2_plot = sub2_plot.copy()
+                    sub2_plot["_cat"] = sub2_plot[color_col].fillna("N/A")
+                    sub2_plot.loc[~sub2_plot["_cat"].isin(cat_color_map), "_cat"] = "Khác"
+                    sub2_plot["_real_h"] = real_hours_plot2
 
-        # Plot Scatter markers using standard Scatter (not Scattergl) to avoid WebGL overlap bugs
-        # Tính giờ thực để hiển thị đúng trong hover
-        real_hours_plot = (x_plot + hour_shift) % 24
-        fig.add_trace(go.Scatter(
-            x=x_plot.tolist(), y=y_plot.tolist(),
-            customdata=real_hours_plot.tolist(),
-            mode='markers',
-            marker=dict(size=4, color="#1B4EF5", opacity=0.4),
-            name="Bill",
-            hovertemplate=f"Xuất phát ({time_labels[0]}): %{{customdata:.2f}}h<br>T.gian VC: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>"
-        ), row=r, col=1)
+                    for cat, c_color in cat_color_map.items():
+                        mask = sub2_plot["_cat"] == cat
+                        if mask.sum() == 0:
+                            continue
+                        show_leg = cat not in legend_shown
+                        legend_shown.add(cat)
+                        fig.add_trace(go.Scatter(
+                            x=sub2_plot.loc[mask, "x2"].tolist(),
+                            y=sub2_plot.loc[mask, "y2"].tolist(),
+                            customdata=sub2_plot.loc[mask, "_real_h"].tolist(),
+                            mode='markers',
+                            marker=dict(size=4, color=c_color, opacity=0.5),
+                            name=cat, legendgroup=cat, showlegend=show_leg,
+                            hovertemplate=(
+                                f"Xuất phát ({time_labels[0]}): %{{customdata:.2f}}h<br>"
+                                f"Giờ đến: %{{y:.1f}}h<br>"
+                                f"{color_col}: {cat}<br>"
+                                f"Cặp: {pair}<extra></extra>"
+                            ),
+                        ), row=r, col=2)
+                else:
+                    fig.add_trace(go.Scatter(
+                        x=x2_plot.tolist(), y=y2_plot.tolist(),
+                        customdata=real_hours_plot2.tolist(),
+                        mode='markers', marker=dict(size=4, color="#F59E0B", opacity=0.4),
+                        name="Bill", showlegend=False,
+                        hovertemplate=f"Xuất phát ({time_labels[0]}): %{{customdata:.2f}}h<br>Giờ đến: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>", 
+                    ))
 
-        # Plot Trend Line on top of everything
-        if x_line is not None:
-            real_x_line = (x_line + hour_shift) % 24
-            fig.add_trace(go.Scatter(
-                x=x_line.tolist(), y=y_line.tolist(),
-                customdata=real_x_line.tolist(),
-                mode='lines',
-                line=dict(color='red', width=2),
-                name="Trend",
-                hovertemplate="Xuất phát: %{customdata:.2f}h<br>T.gian VC (dự báo): %{y:.1f}h<extra></extra>"
-            ), row=r, col=1)
+                
+                tv_x2 = list(range(0, 25, 2))
+                tt_x2 = [f"{int((v + hour_shift) % 24)}h" for v in tv_x2]
+                
+                tv_y2 = list(range(0, 37, 3))
+                tt_y2 = [f"{v % 24}h" + ("" if v < 24 else " (+1d)") for v in tv_y2]
+                
+                fig.update_xaxes(title_text=f"Giờ xuất phát ({time_labels[0]})", range=[0, 24], tickvals=tv_x2, ticktext=tt_x2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
+                fig.update_yaxes(title_text=f"Giờ tại {time_labels[1]}", range=[0, 36], tickvals=tv_y2, ticktext=tt_y2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
 
-        # Tick labels hiển thị giờ thực thay vì giá trị shifted
-        _tv_s = list(range(0, 25, 2))
-        _tt_s = [f"{int((v + hour_shift) % 24)}h" for v in _tv_s]
-        fig.update_xaxes(title_text=f"Giờ xuất phát ({time_labels[0]})", range=[0, 24], tickvals=_tv_s, ticktext=_tt_s, showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
-        fig.update_yaxes(title_text=f"Thời gian VC (h)", rangemode="tozero", showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
-
+    color_label = f" — Màu theo {color_col}" if color_col else ""
     fig.update_layout(
         title=dict(
-            text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} kho bưu cục theo {sort_label} — Scatter: Giờ xuất phát vs Thời gian vận chuyển</sup>",
+            text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} kho bưu cục theo {sort_label} — Scatter: Tương quan Thời gian vận chuyển và Giờ đến{color_label}</sup>",
             x=0.5, xanchor="center", font=dict(size=15)),
-        height=total_plot_height + 120, width=FIG_WIDTH, showlegend=False,
+        height=total_plot_height + 120, width=FIG_WIDTH,
+        showlegend=bool(cat_color_map),
+        legend=dict(
+            title=dict(text=color_col or "", font=dict(size=12)),
+            font=dict(size=10), bgcolor="rgba(255,255,255,0.9)",
+            bordercolor="#D1D5DB", borderwidth=1,
+            orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
+        ) if cat_color_map else dict(),
         plot_bgcolor="#F9FAFB", paper_bgcolor="#FFFFFF",
         font=dict(family="Segoe UI, Arial", size=11),
-        margin=dict(t=110, b=30, l=70, r=40))
+        margin=dict(t=140 if cat_color_map else 110, b=30, l=70, r=40))
     return fig
 
 
-# ── Figure 4: Scatter End-to-End (Kho gửi nguồn → Kho nhận đích) ──────────
-def build_e2e_scatter_fig(df_e2e, pairs, title_prefix, sort_label, pair_shifts):
-    """Scatter plot: X = giờ check OUT kho_o, Y = giờ check IN kho_d.
-    Cả 2 trục dùng offset từ 0h ngày xuất phát (giống logic violin 2).
-    Lọc bỏ > 72h."""
-    rows = len(pairs)
-    cols = 1
-
-    gap_px = 60
-    S_PAIR_H = 400
-    total_plot_height = rows * S_PAIR_H + (rows - 1) * gap_px
-
-    subplot_titles = [f"{pair}<br>(Giờ OUT Kho gửi vs Giờ IN Kho nhận)" for pair in pairs]
-    fig = make_subplots(rows=rows, cols=cols, subplot_titles=subplot_titles,
-                         vertical_spacing=vspacing(rows, 0.02))
-
-    for p, pair in enumerate(pairs):
-        r = p + 1
-        sub = df_e2e.loc[df_e2e["pair"] == pair, ["time_o", "time_d"]].dropna().copy()
-        if sub.empty:
-            continue
-
-        dt_o = pd.to_datetime(sub["time_o"])
-        dt_d = pd.to_datetime(sub["time_d"])
-        departure_date = dt_o.dt.normalize()  # 0h ngày xuất phát
-
-        x_offset = (dt_o - departure_date).dt.total_seconds() / 3600.0  # giờ OUT offset
-        y_offset = (dt_d - departure_date).dt.total_seconds() / 3600.0  # giờ IN offset
-
-        sub["x_off"] = x_offset.values
-        sub["y_off"] = y_offset.values
-
-        # Lọc bỏ outlier: chỉ giữ 0 ≤ offset ≤ 72h
-        sub = sub[(sub["x_off"] >= 0) & (sub["x_off"] <= 48)
-                & (sub["y_off"] >= 0) & (sub["y_off"] <= 72)].copy()
-        if sub.empty:
-            continue
-
-        x_vals = sub["x_off"]
-        y_vals = sub["y_off"]
-        n = len(x_vals)
-
-        # Regression + PI band
-        x_line, y_line = None, None
-        if n > 2:
-            x_arr = x_vals.values
-            y_arr = y_vals.values
-            try:
-                p_coef, cov = np.polyfit(x_arr, y_arr, 1, cov=True)
-                m, c = p_coef
-                x_line = np.linspace(x_arr.min(), x_arr.max(), 100)
-                y_line = m * x_line + c
-
-                y_err = y_arr - (m * x_arr + c)
-                dof = n - 2
-                s_err = np.sqrt(np.sum(y_err**2) / max(dof, 1))
-                t_val = stats.t.ppf(0.975, max(dof, 1))
-                mean_x = np.mean(x_arr)
-                ss_x = np.sum((x_arr - mean_x)**2)
-                pi = t_val * s_err * np.sqrt(1 + 1/n + (x_line - mean_x)**2 / max(ss_x, 1e-6))
-
-                x_ci = np.concatenate([x_line, x_line[::-1]]).tolist()
-                y_ci = np.concatenate([y_line + pi, (y_line - pi)[::-1]]).tolist()
-                fig.add_trace(go.Scatter(
-                    x=x_ci, y=y_ci,
-                    fill='toself', fillcolor='rgba(239, 68, 68, 0.2)',
-                    line=dict(color='rgba(255,255,255,0)'),
-                    hoverinfo="skip", showlegend=False, name="95% PI"
-                ), row=r, col=1)
-            except Exception as e:
-                print(f"  !! Cannot plot E2E regression for {pair}: {e}")
-                x_line, y_line = None, None
-
-        # Downsample
-        if n > 10000:
-            sample_idx = sub.sample(10000, random_state=42).index
-            x_plot = x_vals.loc[sample_idx]
-            y_plot = y_vals.loc[sample_idx]
-        else:
-            x_plot = x_vals
-            y_plot = y_vals
-
-        # Tính giờ thực (mod 24) cho hover
-        real_x = x_plot % 24
-        real_y = y_plot % 24
-        fig.add_trace(go.Scatter(
-            x=x_plot.tolist(), y=y_plot.tolist(),
-            customdata=np.column_stack([real_x.values, real_y.values]).tolist(),
-            mode='markers',
-            marker=dict(size=4, color="#7C3AED", opacity=0.4),
-            name="Bill",
-            hovertemplate=(
-                "Giờ OUT Kho gửi: %{customdata[0]:.1f}h (offset %{x:.1f}h)<br>"
-                "Giờ IN Kho nhận: %{customdata[1]:.1f}h (offset %{y:.1f}h)<br>"
-                f"Cặp: {pair}<extra></extra>"
-            )
-        ), row=r, col=1)
-
-        # Trend line
-        if x_line is not None:
-            real_xl = x_line % 24
-            real_yl = y_line % 24
-            fig.add_trace(go.Scatter(
-                x=x_line.tolist(), y=y_line.tolist(),
-                customdata=np.column_stack([real_xl, real_yl]).tolist(),
-                mode='lines', line=dict(color='red', width=2),
-                name="Trend",
-                hovertemplate="OUT: %{customdata[0]:.1f}h → IN: %{customdata[1]:.1f}h<extra></extra>"
-            ), row=r, col=1)
-
-        # Tick labels: offset → giờ thực + (+Nd)
-        def _offset_ticks(max_h, step=3):
-            tv = list(range(0, int(max_h) + 1, step))
-            tt = []
-            for v in tv:
-                label = f"{v % 24}h"
-                if v >= 48:
-                    label += " (+2d)"
-                elif v >= 24:
-                    label += " (+1d)"
-                tt.append(label)
-            return tv, tt
-
-        tv_x, tt_x = _offset_ticks(48, 3)
-        tv_y, tt_y = _offset_ticks(72, 6)
-        fig.update_xaxes(title_text="Giờ OUT Kho gửi (offset từ 0h ngày xuất phát)",
-                         range=[0, 48], tickvals=tv_x, ticktext=tt_x,
-                         showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
-        fig.update_yaxes(title_text="Giờ IN Kho nhận (offset từ 0h ngày xuất phát)",
-                         range=[0, 72], tickvals=tv_y, ticktext=tt_y,
-                         showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
-
-    fig.update_layout(
-        title=dict(
-            text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} kho bưu cục theo {sort_label} — Scatter: Giờ OUT Kho gửi vs Giờ IN Kho nhận (end-to-end)</sup>",
-            x=0.5, xanchor="center", font=dict(size=15)),
-        height=total_plot_height + 120, width=FIG_WIDTH, showlegend=False,
-        plot_bgcolor="#F9FAFB", paper_bgcolor="#FFFFFF",
-        font=dict(family="Segoe UI, Arial", size=11),
-        margin=dict(t=110, b=30, l=70, r=40))
-    return fig
-
-
-def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title, fig_e2e=None):
+def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title):
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
     bar_div    = pio.to_html(fig_bar, full_html=False, include_plotlyjs=False)
     violin_div = pio.to_html(fig_violin, full_html=False, include_plotlyjs=False)
     scatter_div = pio.to_html(fig_scatter, full_html=False, include_plotlyjs=False)
-    e2e_div = pio.to_html(fig_e2e, full_html=False, include_plotlyjs=False) if fig_e2e else ""
-    e2e_tab_btn = '<button class="tab-btn" onclick="openTab(event, \'E2EScatter\')">' + 'Orgin->Destination</button>' if fig_e2e else ""
-    e2e_tab_content = f'<div id="E2EScatter" class="tabcontent">{e2e_div}</div>' if fig_e2e else ""
     html = f"""<!DOCTYPE html>
 <html lang="vi">
 <head>
@@ -629,7 +704,6 @@ def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title, 
     <button class="tab-btn active" onclick="openTab(event, 'BarChart')">Phân phối (Bar Chart)</button>
     <button class="tab-btn" onclick="openTab(event, 'ViolinPlot')">Tương quan (Violin Plot)</button>
     <button class="tab-btn" onclick="openTab(event, 'ScatterPlot')">Phân tán (Scatter Plot)</button>
-    {e2e_tab_btn}
   </div>
 
   <div id="BarChart" class="tabcontent" style="display:block;">
@@ -643,8 +717,6 @@ def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title, 
   <div id="ScatterPlot" class="tabcontent">
     {scatter_div}
   </div>
-
-  {e2e_tab_content}
 
   <script>
   function openTab(evt, tabName) {{
@@ -669,7 +741,7 @@ def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title, 
     print(f"  ==> {out_file}")
 
 
-def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None, is_dest_flow=False, buu_cuc_set=None, df_e2e=None):
+def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None, is_dest_flow=False, buu_cuc_set=None, color_col=None):
     required = {col_a, col_b, "bill_code", wt_col, "time"}
     if time_cols:
         required.update(time_cols)
@@ -685,30 +757,18 @@ def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_
     fig_bar = build_bar_fig(df, pairs, top, sort_label, title_prefix)
     if time_cols:
         t_col = time_cols[0]
+        t_col_2 = time_cols[1]
         pair_shifts = {}
+        pair_shifts2 = {}
         for pair in pairs:
             sub = df.loc[df["pair"] == pair, t_col].dropna()
             pair_shifts[pair] = find_optimal_shift(sub)
+            sub2 = df.loc[df["pair"] == pair, t_col_2].dropna()
+            pair_shifts2[pair] = find_optimal_shift(sub2)
 
         fig_violin = build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts)
-        fig_scatter = build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts)
-
-        # E2E Scatter nếu có dữ liệu merge
-        fig_e2e = None
-        if df_e2e is not None:
-            # Gắn cột "pair" cho df_e2e dựa trên cùng logic top_pairs
-            e2e_with_pair = df_e2e.copy()
-            e2e_with_pair["pair"] = e2e_with_pair[col_a].astype(str) + " → " + e2e_with_pair[col_b].astype(str)
-            if buu_cuc_set is not None:
-                check_col = col_b if is_dest_flow else col_a
-                is_bc = e2e_with_pair[check_col].fillna("").astype(str).str.strip().isin(buu_cuc_set)
-                e2e_with_pair.loc[is_bc, "pair"] = e2e_with_pair.loc[is_bc, "pair"] + " [Bưu Cục]"
-                e2e_with_pair.loc[~is_bc, "pair"] = e2e_with_pair.loc[~is_bc, "pair"] + " [Thường]"
-            e2e_filtered = e2e_with_pair[e2e_with_pair["pair"].isin(pairs)].copy()
-            if not e2e_filtered.empty:
-                fig_e2e = build_e2e_scatter_fig(e2e_filtered, pairs, title_prefix, sort_label, pair_shifts)
-
-        write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, f"{title_prefix} – Top {N_TOP} {sort_label}", fig_e2e=fig_e2e)
+        fig_scatter = build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts, pair_shifts2, color_col=color_col)
+        write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, f"{title_prefix} – Top {N_TOP} {sort_label}")
     else:
         fig_bar.write_html(out_file, include_plotlyjs="cdn")
         print(f"  ==> {out_file}")
@@ -720,37 +780,41 @@ if __name__ == "__main__":
     wh_df = pd.read_csv(wh_path)
     buu_cuc_set = set(wh_df[wh_df['Bưu Cục'] == 'Y']['name'].dropna().str.strip())
 
+    COLOR_COL = "VD_type"  
+    bill_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bill.csv")
+    print(f"Đọc bill.csv (lấy cột '{COLOR_COL}')...")
+    bill_df = pd.read_csv(bill_path, usecols=["bill_code", COLOR_COL])
+    print(f"  bill.csv: {len(bill_df):,} dòng, {bill_df[COLOR_COL].nunique()} loại {COLOR_COL}")
+
     print("Đọc dữ liệu...")
     df_o = pd.read_csv(os.path.join(INPUT_DIR, "origin_head.csv"))
     df_d = pd.read_csv(os.path.join(INPUT_DIR, "destination_tail.csv"))
     print(f"  origin_to_1A : {len(df_o):,} bill")
     print(f"  1A_to_dest   : {len(df_d):,} bill")
 
-    # Merge origin + destination theo bill_code để có dữ liệu end-to-end
-    df_e2e = df_o.merge(
-        df_d[["bill_code", "kho_d1a", "time_d1a", "kho_d", "time_d"]],
-        on="bill_code", how="inner"
-    )
-    print(f"  E2E merged   : {len(df_e2e):,} bill")
+    df_o = df_o.merge(bill_df, on="bill_code", how="left")
+    df_d = df_d.merge(bill_df, on="bill_code", how="left")
+    print(f"  Merge {COLOR_COL}: origin matched {df_o[COLOR_COL].notna().sum():,}/{len(df_o):,}, "
+          f"dest matched {df_d[COLOR_COL].notna().sum():,}/{len(df_d):,}")
 
-    print("\nVẽ top 10 cặp kho BƯU CỤC NHIỀU BILL nhất...")
+    print(f"\nVẽ top {N_TOP} cặp kho BƯU CỤC NHIỀU BILL nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "bill_count", "Kho gửi → Kho 1A nguồn",
-              os.path.join(OUTPUT_DIR, "top10_bill_origin.html"), 
+              os.path.join(OUTPUT_DIR, f"top{N_TOP}_bill_origin.html"), 
               time_cols=["time_o", "time_o1a"], time_labels=["Giờ ra khỏi Kho đầu", "Giờ đến Kho 1A"],
-              is_dest_flow=False, buu_cuc_set=buu_cuc_set, df_e2e=df_e2e)
+              is_dest_flow=False, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
     build_all(df_d, "kho_d1a", "kho_d", "bill_count", "Kho 1A đích → Kho nhận",
-              os.path.join(OUTPUT_DIR, "top10_bill_dest.html"), 
+              os.path.join(OUTPUT_DIR, f"top{N_TOP}_bill_dest.html"), 
               time_cols=["time_d1a", "time_d"], time_labels=["Giờ ra khỏi Kho 1A", "Giờ đến Kho đích"],
-              is_dest_flow=True, buu_cuc_set=buu_cuc_set, df_e2e=df_e2e)
+              is_dest_flow=True, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
 
-    print("\nVẽ top 10 cặp kho BƯU CỤC NHIỀU KG nhất...")
+    print(f"\nVẽ top {N_TOP} cặp kho BƯU CỤC NHIỀU KG nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "total_kg", "Kho gửi → Kho 1A nguồn",
-              os.path.join(OUTPUT_DIR, "top10_kg_origin.html"), 
+              os.path.join(OUTPUT_DIR, f"top{N_TOP}_kg_origin.html"), 
               time_cols=["time_o", "time_o1a"], time_labels=["Giờ ra khỏi Kho đầu", "Giờ đến Kho 1A"],
-              is_dest_flow=False, buu_cuc_set=buu_cuc_set, df_e2e=df_e2e)
+              is_dest_flow=False, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
     build_all(df_d, "kho_d1a", "kho_d", "total_kg", "Kho 1A đích → Kho nhận",
-              os.path.join(OUTPUT_DIR, "top10_kg_dest.html"), 
+              os.path.join(OUTPUT_DIR, f"top{N_TOP}_kg_dest.html"), 
               time_cols=["time_d1a", "time_d"], time_labels=["Giờ ra khỏi Kho 1A", "Giờ đến Kho đích"],
-              is_dest_flow=True, buu_cuc_set=buu_cuc_set, df_e2e=df_e2e)
+              is_dest_flow=True, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
 
-    print("\nXong! 4 file HTML (bar + violin + scatter + E2E) đã được lưu.")
+    print(f"\nXong! 4 file HTML (bar + violin + scatter) đã được lưu. Scatter tô màu theo '{COLOR_COL}'.")
