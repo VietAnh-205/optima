@@ -41,10 +41,10 @@ max_rank_last = sche_last.groupby('bill_code')['wh_rank'].transform('max')
 sche_last['wh_rank_rev'] = max_rank_last - sche_last['wh_rank'] 
 sche_last = sche_last.merge(bill, on = 'bill_code', how = 'inner')
 
-wh_o = (sche_last[sche_last['wh_rank'] == 0][['bill_code', 'warehouse_name', 'io_time']].rename(columns = {'warehouse_name': 'kho_o', 'io_time': 'time_o'})) 
-wh_o1a = (sche_first[sche_first['wh_rank'] == 1][['bill_code', 'warehouse_name', 'io_time', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_o1a', 'io_time': 'time_o1a'}))
-wh_d = (sche_first[sche_first['wh_rank_rev'] == 0][['bill_code', 'warehouse_name', 'io_time']].rename(columns = {'warehouse_name': 'kho_d', 'io_time': 'time_d'})) 
-wh_d1a = (sche_last[sche_last['wh_rank_rev'] == 1][['bill_code', 'warehouse_name', 'io_time', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_d1a', 'io_time': 'time_d1a'})) 
+wh_o = (sche_last[sche_last['wh_rank'] == 0][['bill_code', 'warehouse_name', 'io_time', 'io_status']].rename(columns = {'warehouse_name': 'kho_o', 'io_time': 'time_o', 'io_status': 'status_o'})) 
+wh_o1a = (sche_first[sche_first['wh_rank'] == 1][['bill_code', 'warehouse_name', 'io_time', 'io_status', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_o1a', 'io_time': 'time_o1a', 'io_status': 'status_o1a'}))
+wh_d = (sche_first[sche_first['wh_rank_rev'] == 0][['bill_code', 'warehouse_name', 'io_time','io_status']].rename(columns = {'warehouse_name': 'kho_d', 'io_time': 'time_d', 'io_status': 'status_d'})) 
+wh_d1a = (sche_last[sche_last['wh_rank_rev'] == 1][['bill_code', 'warehouse_name', 'io_time', 'io_status', 'actual_weight']].rename(columns = {'warehouse_name': 'kho_d1a', 'io_time': 'time_d1a', 'io_status': 'status_d1a'})) 
 
 pair_o = (wh_o.merge(wh_o1a, on = 'bill_code', how = 'inner'))
 pair_d = (wh_d1a.merge(wh_d, on = 'bill_code', how = 'inner')) 
@@ -54,8 +54,8 @@ pair_o = pair_o[pair_o['kho_o1a'].isin(set_1a)]
 pair_d = pair_d[pair_d['kho_d1a'].isin(set_1a)] 
 pair_d = pair_d[~pair_d['kho_d'].isin(set_1a)] 
 
-pair_o['time'] = (((pair_o['time_o1a'] - pair_o['time_o']).dt.total_seconds())/3600).round(0).astype('Int64') 
-pair_d['time'] = (((pair_d['time_d'] - pair_d['time_d1a']).dt.total_seconds())/3600).round(0).astype("Int64") 
+pair_o['time'] = (((pair_o['time_o1a'] - pair_o['time_o']).dt.total_seconds())/3600)
+pair_d['time'] = (((pair_d['time_d'] - pair_d['time_d1a']).dt.total_seconds())/3600)
 
 
 pair_o.to_csv(os.path.join(OUTPUT_DIR, 'origin_to_1A.csv'), index = False) 

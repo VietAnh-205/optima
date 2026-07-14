@@ -9,6 +9,7 @@ import plotly.graph_objects as go
 import plotly.io as pio
 from plotly.subplots import make_subplots
 from sklearn.tree import DecisionTreeRegressor
+from sklearn.cluster import DBSCAN
 
 INPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_all_traces")
 OUTPUT_DIR = 'output_plot'
@@ -173,11 +174,11 @@ def build_bar_fig(df, pairs, top, sort_label, title_prefix):
                           line=dict(dash="dash", color="#E65100", width=1.5))
             fig.add_annotation(xref=axref(ax), yref=axref(ax, "y", " domain"),
                                 x=lab, y=0.97, xanchor="left", yanchor="top",
-                                text=f"Med={med:.0f}h", showarrow=False,
+                                text=f"Med={med:.1f}h", showarrow=False,
                                 font=dict(size=8, color="#E65100"))
 
         fig.add_annotation(
-            text=f"N={n_bill:,} | {total_kg/1000:.1f}T<br>Med={med:.0f}h  Mean={mean:.0f}h",
+            text=f"N={n_bill:,} | {total_kg/1000:.1f}T<br>Med={med:.1f}h  Mean={mean:.1f}h",
             xref=axref(ax, "x", " domain"), yref=axref(ax, "y", " domain"),
             xanchor="left", yanchor="top", x=0.01, y=0.99, showarrow=False,
             font=dict(size=9, color="#374151"), bgcolor="rgba(255,255,255,0.85)",
@@ -275,7 +276,7 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
                         f"<b>{h}h–{h_next}h</b><br>"
                         f"Mốc: {time_labels[0]}<br>"
                         f"Số bill: {count_h:,} ({pct_h:.1f}%)<br>"
-                        f"Thời gian vc: %{{x:.0f}}h<br>"
+                        f"Thời gian vc: %{{x:.1f}}h<br>"
                         f"Cặp: {pair}<extra></extra>"
                     ),
                 ), row=r, col=1)
@@ -351,7 +352,7 @@ def build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label
         margin=dict(t=110, b=30, l=70, r=40), violingap=0)
     return fig
 
-def add_dt_regression_traces(fig, r, c, x_vals, y_vals, hour_shift):
+def add_dt_regression_traces(fig, r, c, x_vals, y_vals, hour_shift, line_color='#EF4444', fill_color='rgba(239, 68, 68, 0.15)', name_prefix=""):
     """Tính toán và vẽ đường hồi quy Step Function bằng Decision Tree"""
     if len(x_vals) < 10:
         return
@@ -391,16 +392,16 @@ def add_dt_regression_traces(fig, r, c, x_vals, y_vals, hour_shift):
         
         # Vẽ dải PI (Prediction Interval)
         fig.add_trace(go.Scatter(
-            x=x_ci, y=y_ci, fill='toself', fillcolor='rgba(239, 68, 68, 0.15)',
-            line=dict(color='rgba(255,255,255,0)'), hoverinfo="skip", showlegend=False, name=f"PI"
+            x=x_ci, y=y_ci, fill='toself', fillcolor=fill_color,
+            line=dict(color='rgba(255,255,255,0)'), hoverinfo="skip", showlegend=False, name=f"{name_prefix}PI"
         ), row=r, col=c)
         
         # Vẽ đường Step Function
         fig.add_trace(go.Scatter(
             x=x_line.tolist(), y=y_line.tolist(),
             customdata=real_x_line.tolist(),
-            mode='lines', line=dict(color='#EF4444', width=3, shape='vh'),
-            name=f"Trend (Cut-off)", showlegend=False,
+            mode='lines', line=dict(color=line_color, width=3, shape='vh'),
+            name=f"{name_prefix}Trend", showlegend=False,
             hovertemplate="Trục X (thực tế): %{customdata:.2f}h<br>Dự báo (Y): %{y:.1f}<extra></extra>"
         ), row=r, col=c)
                     
@@ -477,8 +478,8 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 y3_vals = sub3["time"]
                 
                 n3 = len(x3_vals)
-                # Vẽ Decision Tree Regression
-                add_dt_regression_traces(fig, r, 1, x3_vals, y3_vals, hour_shift2)
+                # Vẽ Decision Tree Regression (Tạm ẩn theo yêu cầu)
+                # add_dt_regression_traces(fig, r, 1, x3_vals, y3_vals, hour_shift2)
 
                 # Sampling nếu quá nhiều điểm
                 if n3 > 10000:
@@ -491,41 +492,14 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 y3_plot = sub3_plot["time"]
                 real_hours_plot3 = (x3_plot + hour_shift2) % 24
 
-                # --- Vẽ scatter theo phân loại hoặc 1 màu ---
-                if cat_color_map:
-                    sub3_plot = sub3_plot.copy()
-                    sub3_plot["_cat"] = sub3_plot[color_col].fillna("N/A")
-                    sub3_plot.loc[~sub3_plot["_cat"].isin(cat_color_map), "_cat"] = "Khác"
-                    sub3_plot["_real_h"] = real_hours_plot3
-
-                    for cat, c_color in cat_color_map.items():
-                        mask = sub3_plot["_cat"] == cat
-                        if mask.sum() == 0:
-                            continue
-                        show_leg = cat not in legend_shown
-                        legend_shown.add(cat)
-                        fig.add_trace(go.Scatter(
-                            x=sub3_plot.loc[mask, "_x_shifted"].tolist(),
-                            y=sub3_plot.loc[mask, "time"].tolist(),
-                            customdata=sub3_plot.loc[mask, "_real_h"].tolist(),
-                            mode='markers',
-                            marker=dict(size=4, color=c_color, opacity=0.5),
-                            name=cat, legendgroup=cat, showlegend=show_leg,
-                            hovertemplate=(
-                                f"Đến ({time_labels[1]}): %{{customdata:.2f}}h<br>"
-                                f"T.gian VC: %{{y:.1f}}h<br>"
-                                f"{color_col}: {cat}<br>"
-                                f"Cặp: {pair}<extra></extra>"
-                            ),
-                        ), row=r, col=1)
-                else:
-                    fig.add_trace(go.Scatter(
-                        x=x3_plot.tolist(), y=y3_plot.tolist(),
-                        customdata=real_hours_plot3.tolist(),
-                        mode='markers', marker=dict(size=4, color="#10B981", opacity=0.4),
-                        name="Bill", showlegend=False,
-                        hovertemplate=f"Đến ({time_labels[1]}): %{{customdata:.2f}}h<br>T.gian VC: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>"
-                    ), row=r, col=1)
+                # --- Vẽ scatter 1 màu mặc định (Bỏ tô màu theo VD_type) ---
+                fig.add_trace(go.Scatter(
+                    x=x3_plot.tolist(), y=y3_plot.tolist(),
+                    customdata=real_hours_plot3.tolist(),
+                    mode='markers', marker=dict(size=4, color="#10B981", opacity=0.4),
+                    name="Bill", showlegend=False,
+                    hovertemplate=f"Đến ({time_labels[1]}): %{{customdata:.2f}}h<br>T.gian VC: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>"
+                ), row=r, col=1)
 
                 _tv_s3 = list(range(0, 25, 2))
                 _tt_s3 = [f"{int((v + hour_shift2) % 24)}h" for v in _tv_s3]
@@ -553,8 +527,8 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
             sub2 = sub2[(sub2["y2"] >= 0) & (sub2["y2"] <= 36)].copy()
             
             if not sub2.empty:
-                q1_2 = sub2["y2"].quantile(0.1)
-                q3_2 = sub2["y2"].quantile(0.9)
+                q1_2 = sub2["y2"].quantile(0.05)
+                q3_2 = sub2["y2"].quantile(0.95)
                 sub2 = sub2[(sub2["y2"] >= q1_2) & (sub2["y2"] <= q3_2)].copy()
 
             if not sub2.empty:
@@ -569,8 +543,8 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 y2_vals = sub2["y2"]
                 n2 = len(x2_vals)
                 
-                # Vẽ Decision Tree Regression
-                add_dt_regression_traces(fig, r, 2, x2_vals, y2_vals, hour_shift)
+                # Vẽ Decision Tree Regression (Tạm ẩn theo yêu cầu)
+                # add_dt_regression_traces(fig, r, 2, x2_vals, y2_vals, hour_shift)
                 
                 # Sampling nếu quá nhiều điểm
                 if n2 > 10000:
@@ -583,41 +557,60 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 y2_plot = sub2_plot["y2"]
                 real_hours_plot2 = (x2_plot + hour_shift) % 24
 
-                # --- Vẽ scatter theo phân loại hoặc 1 màu ---
-                if cat_color_map:
-                    sub2_plot = sub2_plot.copy()
-                    sub2_plot["_cat"] = sub2_plot[color_col].fillna("N/A")
-                    sub2_plot.loc[~sub2_plot["_cat"].isin(cat_color_map), "_cat"] = "Khác"
-                    sub2_plot["_real_h"] = real_hours_plot2
-
-                    for cat, c_color in cat_color_map.items():
-                        mask = sub2_plot["_cat"] == cat
-                        if mask.sum() == 0:
-                            continue
-                        show_leg = cat not in legend_shown
-                        legend_shown.add(cat)
-                        fig.add_trace(go.Scatter(
-                            x=sub2_plot.loc[mask, "x2"].tolist(),
-                            y=sub2_plot.loc[mask, "y2"].tolist(),
-                            customdata=sub2_plot.loc[mask, "_real_h"].tolist(),
-                            mode='markers',
-                            marker=dict(size=4, color=c_color, opacity=0.5),
-                            name=cat, legendgroup=cat, showlegend=show_leg,
-                            hovertemplate=(
-                                f"Xuất phát ({time_labels[0]}): %{{customdata:.2f}}h<br>"
-                                f"Giờ đến: %{{y:.1f}}h<br>"
-                                f"{color_col}: {cat}<br>"
-                                f"Cặp: {pair}<extra></extra>"
-                            ),
-                        ), row=r, col=2)
-                else:
+                # Chạy DBSCAN
+                y_for_cluster = y2_plot.values.reshape(-1, 1)
+                dbscan = DBSCAN(eps=0.5, min_samples=50)
+                clusters = dbscan.fit_predict(y_for_cluster)
+                sub2_plot = sub2_plot.copy()
+                sub2_plot["_cluster"] = clusters
+                sub2_plot["_real_h"] = real_hours_plot2
+                
+                # Bảng màu cho các cụm chính
+                cluster_colors = ["#EF4444", "#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#06B6D4", "#EC4899", "#14B8A6"]
+                
+                def hex_to_rgba(hex_str, alpha):
+                    h = hex_str.lstrip('#')
+                    rgb = tuple(int(h[i:i+2], 16) for i in (0, 2, 4))
+                    return f"rgba({rgb[0]}, {rgb[1]}, {rgb[2]}, {alpha})"
+                
+                unique_clusters = sorted(sub2_plot["_cluster"].unique())
+                for clus in unique_clusters:
+                    mask = sub2_plot["_cluster"] == clus
+                    if mask.sum() == 0:
+                        continue
+                        
+                    x_clus = sub2_plot.loc[mask, "x2"]
+                    y_clus = sub2_plot.loc[mask, "y2"]
+                        
+                    if clus == -1:
+                        c_color = "rgba(156, 163, 175, 0.4)" # Xám nhạt cho điểm nhiễu
+                        c_name = "Nhiễu (Noise)"
+                        opacity_val = 0.2
+                    else:
+                        c_color = cluster_colors[clus % len(cluster_colors)]
+                        c_name = f"Cụm {clus+1}"
+                        opacity_val = 0.6
+                        
+                        # Vẽ Decision Tree riêng cho cụm này
+                        fill_c = hex_to_rgba(c_color, 0.15)
+                        add_dt_regression_traces(fig, r, 2, x_clus, y_clus, hour_shift, line_color="#000000", fill_color=fill_c, name_prefix=f"{c_name} - ")
+                        
+                    show_leg = c_name not in legend_shown
+                    legend_shown.add(c_name)
                     fig.add_trace(go.Scatter(
-                        x=x2_plot.tolist(), y=y2_plot.tolist(),
-                        customdata=real_hours_plot2.tolist(),
-                        mode='markers', marker=dict(size=4, color="#F59E0B", opacity=0.4),
-                        name="Bill", showlegend=False,
-                        hovertemplate=f"Xuất phát ({time_labels[0]}): %{{customdata:.2f}}h<br>Giờ đến: %{{y:.1f}}h<br>Cặp: {pair}<extra></extra>", 
-                    ))
+                        x=sub2_plot.loc[mask, "x2"].tolist(),
+                        y=sub2_plot.loc[mask, "y2"].tolist(),
+                        customdata=sub2_plot.loc[mask, "_real_h"].tolist(),
+                        mode='markers',
+                        marker=dict(size=4, color=c_color, opacity=opacity_val),
+                        name=c_name, legendgroup=c_name, showlegend=show_leg,
+                        hovertemplate=(
+                            f"Xuất phát ({time_labels[0]}): %{{customdata:.2f}}h<br>"
+                            f"Giờ đến: %{{y:.1f}}h<br>"
+                            f"Nhóm: {c_name}<br>"
+                            f"Cặp: {pair}<extra></extra>"
+                        ),
+                    ), row=r, col=2)
 
                 
                 tv_x2 = list(range(0, 25, 2))
@@ -629,15 +622,15 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 fig.update_xaxes(title_text=f"Giờ xuất phát ({time_labels[0]})", range=[0, 24], tickvals=tv_x2, ticktext=tt_x2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
                 fig.update_yaxes(title_text=f"Giờ tại {time_labels[1]}", range=[0, 36], tickvals=tv_y2, ticktext=tt_y2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
 
-    color_label = f" — Màu theo {color_col}" if color_col else ""
+    color_label = f" — Phân cụm (DBSCAN)"
     fig.update_layout(
         title=dict(
             text=f"<b>{title_prefix}</b><br><sup>Top {N_TOP} kho bưu cục theo {sort_label} — Scatter: Tương quan Thời gian vận chuyển và Giờ đến{color_label}</sup>",
             x=0.5, xanchor="center", font=dict(size=15)),
         height=total_plot_height + 120, width=FIG_WIDTH,
-        showlegend=bool(cat_color_map),
+        showlegend=True,
         legend=dict(
-            title=dict(text=color_col or "", font=dict(size=12)),
+            title=dict(text="Cụm dữ liệu", font=dict(size=12)),
             font=dict(size=10), bgcolor="rgba(255,255,255,0.9)",
             bordercolor="#D1D5DB", borderwidth=1,
             orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5,
@@ -650,6 +643,7 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
 
 def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title):
     os.makedirs(os.path.dirname(out_file), exist_ok=True)
+    # Khôi phục render HTML cho 2 tab
     bar_div    = pio.to_html(fig_bar, full_html=False, include_plotlyjs=False)
     violin_div = pio.to_html(fig_violin, full_html=False, include_plotlyjs=False)
     scatter_div = pio.to_html(fig_scatter, full_html=False, include_plotlyjs=False)
