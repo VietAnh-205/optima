@@ -507,29 +507,43 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 fig.update_yaxes(title_text=f"Thời gian VC (h)", rangemode="tozero", showgrid=True, gridcolor="#E5E7EB", row=r, col=1)
 
         # --- CỘT 2 (Phải): X = Giờ xuất phát, Y = Giờ đến (offset) ---
-        needed_cols_2 = [t_col_1, t_col_2]
+        needed_cols_2 = [t_col_1, t_col_2, "time"]
         if color_col and color_col in df.columns:
             needed_cols_2.append(color_col)
-        sub2 = df.loc[df["pair"] == pair, needed_cols_2].dropna(subset=[t_col_1, t_col_2]).copy()
+        sub2 = df.loc[df["pair"] == pair, needed_cols_2].dropna(subset=[t_col_1, t_col_2, "time"]).copy()
+        
+        # Lọc bỏ các bill có thời gian vận chuyển ngoại lai
+        sub2 = sub2[(sub2["time"] <= 100) & (sub2["time"] >= 0)].copy()
+        if not sub2.empty:
+            q1_time = sub2["time"].quantile(0.01)
+            q3_time = sub2["time"].quantile(0.99)
+            sub2 = sub2[(sub2["time"] >= q1_time) & (sub2["time"] <= q3_time)].copy()
+
         if not sub2.empty:
             dt1 = pd.to_datetime(sub2[t_col_1])
             dt2 = pd.to_datetime(sub2[t_col_2])
             
+            # Y2 là THỜI GIAN LIÊN TỤC (Offset từ 0h ngày gửi) để giữ lại "bước nhảy" khi rớt chuyến
             departure_date = dt1.dt.normalize()
             y2_vals_raw = (dt2 - departure_date).dt.total_seconds() / 3600.0
             
             raw_hours2 = dt1.dt.hour + dt1.dt.minute / 60.0 + dt1.dt.second / 3600.0
             x2_vals_raw = (raw_hours2 - hour_shift) % 24
             
+            # Tính Giờ đến trong ngày (có shift) ĐỂ DÀNH RIÊNG CHO PHÂN CỤM DBSCAN
+            arrival_shift = find_optimal_shift(sub2[t_col_2])
+            arrival_tod = dt2.dt.hour + dt2.dt.minute / 60.0 + dt2.dt.second / 3600.0
+            sub2["_y_dbscan"] = (arrival_tod - arrival_shift) % 24
+            
             sub2["x2"] = x2_vals_raw
             sub2["y2"] = y2_vals_raw
             
-            sub2 = sub2[(sub2["y2"] >= 0) & (sub2["y2"] <= 36)].copy()
+            sub2 = sub2[(sub2["y2"] >= 0) & (sub2["y2"] <= 48)].copy()
             
-            if not sub2.empty:
-                q1_2 = sub2["y2"].quantile(0.05)
-                q3_2 = sub2["y2"].quantile(0.95)
-                sub2 = sub2[(sub2["y2"] >= q1_2) & (sub2["y2"] <= q3_2)].copy()
+            # if not sub2.empty:
+            #     q1_2 = sub2["y2"].quantile(0.05)
+            #     q3_2 = sub2["y2"].quantile(0.95)
+            #     sub2 = sub2[(sub2["y2"] >= q1_2) & (sub2["y2"] <= q3_2)].copy()
 
             if not sub2.empty:
                 sub2["_h_bin"] = pd.to_datetime(sub2[t_col_1]).dt.hour
@@ -557,9 +571,9 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 y2_plot = sub2_plot["y2"]
                 real_hours_plot2 = (x2_plot + hour_shift) % 24
 
-                # Chạy DBSCAN
+                # Chạy DBSCAN theo logic cũ (thời gian liên tục)
                 y_for_cluster = y2_plot.values.reshape(-1, 1)
-                dbscan = DBSCAN(eps=0.5, min_samples=50)
+                dbscan = DBSCAN(eps=0.5, min_samples=100)
                 clusters = dbscan.fit_predict(y_for_cluster)
                 sub2_plot = sub2_plot.copy()
                 sub2_plot["_cluster"] = clusters
@@ -616,11 +630,12 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 tv_x2 = list(range(0, 25, 2))
                 tt_x2 = [f"{int((v + hour_shift) % 24)}h" for v in tv_x2]
                 
-                tv_y2 = list(range(0, 37, 3))
-                tt_y2 = [f"{v % 24}h" + ("" if v < 24 else " (+1d)") for v in tv_y2]
+                tv_y2 = list(range(0, 73, 6))
+                tt_y2 = [f"{v % 24}h" + ("" if v < 24 else f" (+{v//24}d)") for v in tv_y2]
+                max_y2 = min(72, y2_plot.max() + 2) if not y2_plot.empty else 48
                 
                 fig.update_xaxes(title_text=f"Giờ xuất phát ({time_labels[0]})", range=[0, 24], tickvals=tv_x2, ticktext=tt_x2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
-                fig.update_yaxes(title_text=f"Giờ tại {time_labels[1]}", range=[0, 36], tickvals=tv_y2, ticktext=tt_y2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
+                fig.update_yaxes(title_text=f"Giờ đến ({time_labels[1]}) (Offset từ ngày gửi)", range=[0, max_y2], tickvals=tv_y2, ticktext=tt_y2, showgrid=True, gridcolor="#E5E7EB", row=r, col=2)
 
     color_label = f" — Phân cụm (DBSCAN)"
     fig.update_layout(

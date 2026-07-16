@@ -54,8 +54,8 @@ pair_o = pair_o[pair_o['kho_o1a'].isin(set_1a)]
 pair_d = pair_d[pair_d['kho_d1a'].isin(set_1a)] 
 pair_d = pair_d[~pair_d['kho_d'].isin(set_1a)] 
 
-pair_o['time'] = (((pair_o['time_o1a'] - pair_o['time_o']).dt.total_seconds())/3600)
-pair_d['time'] = (((pair_d['time_d'] - pair_d['time_d1a']).dt.total_seconds())/3600)
+pair_o['time'] = (((pair_o['time_o1a'] - pair_o['time_o']).dt.total_seconds())/3600).round(2).astype("Int64")
+pair_d['time'] = (((pair_d['time_d'] - pair_d['time_d1a']).dt.total_seconds())/3600).round(2).astype("Int64")
 
 
 pair_o.to_csv(os.path.join(OUTPUT_DIR, 'origin_to_1A.csv'), index = False) 
