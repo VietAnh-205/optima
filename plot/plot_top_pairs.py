@@ -98,11 +98,9 @@ def validate_columns(df, required, name):
         raise ValueError(f"[{name}] Thiếu cột: {sorted(missing)}. Hiện có: {list(df.columns)}")
 
 
-def top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow=False, buu_cuc_set=None):
+def top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow=False):
     df = df.copy()
     
-    # # Lọc bỏ các kho trong danh sách bị loại trừ
-    # df = df[~df[col_a].isin(EXCLUDED_KHO) & ~df[col_b].isin(EXCLUDED_KHO)].copy()
     if is_dest_flow: 
         df = df[~df[col_b].isin(EXCLUDED_KHO)] 
     else: 
@@ -111,21 +109,6 @@ def top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow=False, buu_cuc_set
     
     check_col = col_b if is_dest_flow else col_a
     key = "so_bill" if sort_by == "bill_count" else "tong_kg"
-    
-    if buu_cuc_set is not None:
-        is_bc = df[check_col].fillna("").astype(str).str.strip().isin(buu_cuc_set)
-        df.loc[is_bc, "pair"] = df.loc[is_bc, "pair"] + " [Bưu Cục]"
-        df.loc[~is_bc, "pair"] = df.loc[~is_bc, "pair"] + " [Thường]"
-
-        # Chỉ giữ lại các bill có kho đầu (origin) / kho cuối (dest) là Bưu Cục
-        df = df[is_bc].copy()
-
-        agg = (df.groupby(["pair", check_col])
-                 .agg(so_bill=("bill_code", "nunique"), tong_kg=(wt_col, "sum"))
-                 .reset_index())
-
-        top_bc = agg.nlargest(N_TOP, key)
-        return df, top_bc.reset_index(drop=True)
         
     agg = (df.groupby(["pair", check_col])
              .agg(so_bill=("bill_code", "nunique"), tong_kg=(wt_col, "sum"))
@@ -785,9 +768,6 @@ def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_
 
 if __name__ == "__main__":
     print("Đọc dữ liệu kho...")
-    wh_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "warehouse.csv")
-    wh_df = pd.read_csv(wh_path)
-    buu_cuc_set = set(wh_df[wh_df['Bưu Cục'] == 'Y']['name'].dropna().str.strip())
 
     COLOR_COL = "VD_type"  
     bill_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bill.csv")
@@ -810,20 +790,20 @@ if __name__ == "__main__":
     build_all(df_o, "kho_o", "kho_o1a", "bill_count", "Kho gửi → Kho 1A nguồn",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_bill_origin.html"), 
               time_cols=["time_o", "time_o1a"], time_labels=["Giờ ra khỏi Kho đầu", "Giờ đến Kho 1A"],
-              is_dest_flow=False, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
+              is_dest_flow=False, color_col=COLOR_COL)
     build_all(df_d, "kho_d1a", "kho_d", "bill_count", "Kho 1A đích → Kho nhận",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_bill_dest.html"), 
               time_cols=["time_d1a", "time_d"], time_labels=["Giờ ra khỏi Kho 1A", "Giờ đến Kho đích"],
-              is_dest_flow=True, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
+              is_dest_flow=True, color_col=COLOR_COL)
 
     print(f"\nVẽ top {N_TOP} cặp kho BƯU CỤC NHIỀU KG nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "total_kg", "Kho gửi → Kho 1A nguồn",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_kg_origin.html"), 
               time_cols=["time_o", "time_o1a"], time_labels=["Giờ ra khỏi Kho đầu", "Giờ đến Kho 1A"],
-              is_dest_flow=False, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
+              is_dest_flow=False, color_col=COLOR_COL)
     build_all(df_d, "kho_d1a", "kho_d", "total_kg", "Kho 1A đích → Kho nhận",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_kg_dest.html"), 
               time_cols=["time_d1a", "time_d"], time_labels=["Giờ ra khỏi Kho 1A", "Giờ đến Kho đích"],
-              is_dest_flow=True, buu_cuc_set=buu_cuc_set, color_col=COLOR_COL)
+              is_dest_flow=True, color_col=COLOR_COL)
 
     print(f"\nXong! 4 file HTML (bar + violin + scatter) đã được lưu. Scatter tô màu theo '{COLOR_COL}'.")

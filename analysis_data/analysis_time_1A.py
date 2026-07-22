@@ -54,11 +54,45 @@ pair_o = pair_o[pair_o['kho_o1a'].isin(set_1a)]
 pair_d = pair_d[pair_d['kho_d1a'].isin(set_1a)] 
 pair_d = pair_d[~pair_d['kho_d'].isin(set_1a)] 
 
-pair_o['time'] = (((pair_o['time_o1a'] - pair_o['time_o']).dt.total_seconds())/3600).round(2).astype("Int64")
-pair_d['time'] = (((pair_d['time_d'] - pair_d['time_d1a']).dt.total_seconds())/3600).round(2).astype("Int64")
+pair_o['time'] = (((pair_o['time_o1a'] - pair_o['time_o']).dt.total_seconds())/3600)
+pair_d['time'] = (((pair_d['time_d'] - pair_d['time_d1a']).dt.total_seconds())/3600)
 
 
 pair_o.to_csv(os.path.join(OUTPUT_DIR, 'origin_to_1A.csv'), index = False) 
 pair_d.to_csv(os.path.join(OUTPUT_DIR, '1A_to_destination.csv'), index = False) 
+print('pair_o shape', pair_o.shape)
+print('pair_d shape', pair_d.shape)
 
+import json 
+with open("D:\\optima\\VietAnh\\normal_bill_code_sample.json", 'r', encoding='utf-8') as f:
+    data = json.load(f) 
 
+head_data = data.get('head', []) 
+tail_data = data.get('tail', []) 
+head = pd.DataFrame(data['head'], columns = ['bill_code']) 
+tail = pd.DataFrame(data['tail'], columns = ['bill_code'] )
+print('head shape', head.shape) 
+print('tail shape', tail.shape) 
+
+warehouse = pd.read_csv('warehouse.csv') 
+set_bc = warehouse[warehouse['Bưu Cục'] == "Y"]['name'].to_list()
+origin_bc = pair_o[pair_o['kho_o'].isin(set_bc)] 
+des_bc = pair_d[pair_d['kho_d'].isin(set_bc)] 
+print('origin_bc shape: ', origin_bc.shape) 
+print('des_bc shape: ', des_bc.shape) 
+
+oh = origin_bc[origin_bc['bill_code'].isin(set(head['bill_code']))] 
+dt = des_bc[des_bc['bill_code'].isin(set(tail['bill_code']))] 
+print('origin_head shape: ', oh.shape) 
+print('destination_tail shape: ', dt.shape) 
+
+oh_final = oh[((oh['status_o'] == "OUT") & (oh['status_o1a'] == 'IN'))] 
+dt_final = dt[((dt['status_d'] == 'IN') & (dt['status_d1a'] == 'OUT'))] 
+
+print("oh_final shape: ", oh_final.shape)
+print("dt_final shape: ", dt_final.shape) 
+print('percentage origin: ', oh_final.shape[0] / oh.shape[0]) 
+print('percentage destination: ', dt_final.shape[0] / dt.shape[0])
+
+oh_final.to_csv(os.path.join('output_all_traces', 'origin_head.csv'), index = False) 
+dt_final.to_csv(os.path.join('output_all_traces', 'destination_tail.csv'), index = False)
