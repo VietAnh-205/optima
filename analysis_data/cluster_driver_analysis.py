@@ -87,23 +87,55 @@ def interpret_effect(v):
 
 # ── Hàm chính ───────────────────────────────────────────────────────────
 def get_top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow):
-    """Lấy top N cặp kho"""
+    """Lấy top 10 cặp tỉnh có số lượng bill lớn nhất, mỗi cặp tỉnh lấy top 5 cặp kho"""
     df = df.copy()
     if is_dest_flow:
         df = df[~df[col_b].isin(EXCLUDED_KHO)]
     else:
         df = df[~df[col_a].isin(EXCLUDED_KHO)]
-    df["pair"] = df[col_a].astype(str) + " → " + df[col_b].astype(str)
-
-    check_col = col_b if is_dest_flow else col_a
     key = "so_bill" if sort_by == "bill_count" else "tong_kg"
+    # Đọc danh sách kho để lấy thông tin tỉnh
+    wh_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "warehouse.csv")
+    wh = pd.read_csv(wh_path, usecols=['name', 'province'])
+    
+    # Merge province A
+    df = pd.merge(df, wh, left_on=[col_a], right_on=['name'], how='left')
+    df = df.drop(columns=['name']).rename(columns={'province': f'{col_a}_province'})
+    
+    # Merge province B
+    df = pd.merge(df, wh, left_on=[col_b], right_on=['name'], how='left')
+    df = df.drop(columns=['name']).rename(columns={'province': f'{col_b}_province'})
 
-    agg = (df.groupby(["pair", check_col])
-             .agg(so_bill=("bill_code", "nunique"), tong_kg=(wt_col, "sum"))
-             .reset_index())
-    top = agg.nlargest(N_TOP, key)
-    return df, top["pair"].tolist()
+    df["pair"] = df[col_a].astype(str) + " (" + df[f'{col_a}_province'].astype(str) + ") → " + df[col_b].astype(str) + " (" + df[f'{col_b}_province'].astype(str) + ")"
 
+    # Lọc dữ liệu theo luồng
+    if is_dest_flow:
+        df = df[df['destination_province'] == df[f'{col_b}_province']]
+    else:
+        df = df[df['origin_province'] == df[f'{col_a}_province']]
+
+    # Lấy top 10 cặp tỉnh theo số lượng bill
+    agg_prov = df.groupby([f'{col_a}_province', f'{col_b}_province']).agg(
+        so_bill=('bill_code', 'nunique'),
+        tong_kg=(wt_col, 'sum')
+    ).reset_index()
+    top_prov = agg_prov.nlargest(10, key)
+    
+    # Lấy top 5 cặp kho cho mỗi cặp tỉnh
+    final_pairs = []
+    for _, row in top_prov.iterrows():
+        prov_a = row[f'{col_a}_province']
+        prov_b = row[f'{col_b}_province']
+        
+        sub_df = df[(df[f'{col_a}_province'] == prov_a) & (df[f'{col_b}_province'] == prov_b)]
+        agg_kho = sub_df.groupby(["pair"]).agg(
+            so_bill=('bill_code', 'nunique'),
+            tong_kg=(wt_col, 'sum')
+        ).reset_index()
+        top_kho = agg_kho.nlargest(5, key)
+        final_pairs.extend(top_kho['pair'].tolist())
+        
+    return df, final_pairs
 
 
 def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
@@ -262,17 +294,41 @@ def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
                         vals = " | ".join([f"{col}: {ct_display.loc[c_idx, col]:.1f}%" for col in display_cols])
                         print(f"    Cụm {c_idx}: {vals}")
 
-        # ══ Tạo figure Plotly (dùng CHUNG sub_clean từ DBSCAN ở trên) ══
-        subplot_titles = ["Phân cụm dữ liệu (DBSCAN)",
-                          "VD_type (Loại đơn)", "Service (Dịch vụ)",
-                          "Day of Week (Ngày trong tuần)", "Creation Hour (Giờ tạo đơn)",
-                          "Origin Province (Tỉnh gửi)", "Destination Province (Tỉnh nhận)",
-                          "Weight (Khối lượng)"]
+        # ══════════════════════════════════════════════════════════════
+        #  TẠO FIGURE PLOTLY (dùng CHUNG sub_clean từ DBSCAN ở trên)
+        #  Bố cục 9 hàng x 2 cột — mỗi feature đặt 2 góc nhìn cạnh nhau:
+        #   1. Scatter DBSCAN (giờ xuất phát vs giờ đến)
+        #   2. Overall Feature Composition (tổng thể, KHÔNG tách cụm)  <-- MỚI
+        #   3-8. Mỗi hàng 1 feature: [tỷ lệ feature trong mỗi cụm | tỷ lệ cụm trong mỗi feature]
+        #   9. Boxplot Weight
+        # ══════════════════════════════════════════════════════════════
+        subplot_titles = [
+            "Phân cụm dữ liệu (DBSCAN)",
+            "Overall Composition (VD_type / Service / DoW)",
+            "Overall Composition (Hour / Origin / Dest)",
+            "VD_type (Loại đơn) theo Cụm",
+            "VD_type: Tỷ lệ Cụm trong mỗi loại",
+            "Service (Dịch vụ) theo Cụm",
+            "Service: Tỷ lệ Cụm trong mỗi loại",
+            "Day of Week theo Cụm",
+            "Day of Week: Tỷ lệ Cụm trong mỗi ngày",
+            "Creation Hour theo Cụm",
+            "Creation Hour: Tỷ lệ Cụm trong mỗi giờ",
+            "Origin Province theo Cụm",
+            "Origin Province: Tỷ lệ Cụm trong mỗi tỉnh",
+            "Destination Province theo Cụm",
+            "Destination Province: Tỷ lệ Cụm trong mỗi tỉnh",
+            "Weight (Khối lượng)"
+        ]
         fig = make_subplots(
-            rows=5, cols=2, subplot_titles=subplot_titles,
-            row_heights=[0.32, 0.17, 0.17, 0.17, 0.17],
-            horizontal_spacing=0.12, vertical_spacing=0.08,
+            rows=9, cols=2, subplot_titles=subplot_titles,
+            row_heights=[0.16, 0.14, 0.09, 0.09, 0.09, 0.09, 0.09, 0.09, 0.16],
+            horizontal_spacing=0.12, vertical_spacing=0.06,
             specs=[[{"type": "xy"}, None],
+                   [{"type": "bar"}, {"type": "bar"}],
+                   [{"type": "bar"}, {"type": "bar"}],
+                   [{"type": "bar"}, {"type": "bar"}],
+                   [{"type": "bar"}, {"type": "bar"}],
                    [{"type": "bar"}, {"type": "bar"}],
                    [{"type": "bar"}, {"type": "bar"}],
                    [{"type": "bar"}, {"type": "bar"}],
@@ -285,20 +341,19 @@ def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
             "#6366F1", "#EF4444", "#A855F7", "#0EA5E9", "#D946EF"
         ]
         cluster_labels = [f"Cụm {c}" for c in sorted(sub_clean["cluster"].unique())]
+        cluster_colors = ["#EF4444", "#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#06B6D4", "#EC4899", "#14B8A6"]
 
-        # --- THÊM SCATTER PLOT (DBSCAN) VÀO HÀNG 1 ---
+        # --- HÀNG 1: SCATTER PLOT (DBSCAN) ---
         hour_shift = find_optimal_shift(sub_clean[t_col_1])
         dt1_clean = pd.to_datetime(sub_clean[t_col_1])
         raw_hours = dt1_clean.dt.hour + dt1_clean.dt.minute / 60.0 + dt1_clean.dt.second / 3600.0
         x_vals = (raw_hours - hour_shift) % 24
-        
-        cluster_colors = ["#EF4444", "#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#06B6D4", "#EC4899", "#14B8A6"]
-        
+
         for clus in sorted(sub_clean["cluster"].unique()):
             mask = sub_clean["cluster"] == clus
             c_color = cluster_colors[clus % len(cluster_colors)]
             c_name = f"Cụm {clus}"
-            
+
             fig.add_trace(go.Scatter(
                 x=x_vals[mask].tolist(),
                 y=sub_clean.loc[mask, "y_offset"].tolist(),
@@ -313,14 +368,44 @@ def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
                     f"Nhóm: {c_name}<extra></extra>"
                 )
             ), row=1, col=1)
-            
+
         tv_x2 = list(range(0, 25, 2))
         tt_x2 = [f"{int((v + hour_shift) % 24)}h" for v in tv_x2]
-        fig.update_xaxes(title_text="Giờ xuất phát", range=[0, 24], tickvals=tv_x2, ticktext=tt_x2, showgrid=True, gridcolor="#E5E7EB", row=1, col=1)
+        fig.update_xaxes(title_text="Giờ xuất phát", range=[0, 24], tickvals=tv_x2, ticktext=tt_x2,
+                          showgrid=True, gridcolor="#E5E7EB", row=1, col=1)
         fig.update_yaxes(title_text="Giờ đến (Offset từ ngày gửi)", showgrid=True, gridcolor="#E5E7EB", row=1, col=1)
-        # ---------------------------------------------
 
-        # Helper: vẽ stacked bar cho 1 biến phân loại
+        # --- HÀNG 2 (MỚI): TỔNG QUAN THÀNH PHẦN DỮ LIỆU (không tách theo cụm) ---
+        def add_feature_composition_stacked(features, row, col):
+            for feat in features:
+                if feat not in sub_clean.columns or sub_clean[feat].isna().all():
+                    continue
+                pct = (
+                    sub_clean[feat]
+                    .value_counts(normalize=True)
+                    .mul(100)
+                    .sort_values(ascending=False)
+                )
+                top = pct.head(6).copy()
+                if len(pct) > 6:
+                    top.loc["Khác"] = pct.iloc[6:].sum()
+
+                fig.add_trace(go.Bar(
+                    x=[f"{feat}<br>{c}" for c in top.index],
+                    y=top.values.tolist(),
+                    name=feat,
+                    marker_color=colors[:len(top)],
+                    text=[f"{v:.1f}%" for v in top.values],
+                    textposition="outside",
+                    showlegend=False,
+                    hovertemplate="<b>%{x}</b><br>%{y:.1f}%<extra></extra>"
+                ), row=row, col=col)
+            fig.update_yaxes(title_text="Tỷ lệ (%)", range=[0, 100], row=row, col=col)
+
+        add_feature_composition_stacked(["VD_type", "service", "day_of_week"], 2, 1)
+        add_feature_composition_stacked(["creation_hour", "origin_province", "destination_province"], 2, 2)
+
+        # --- CỘT 1 của mỗi hàng feature (như bản gốc): tỷ lệ % feature TRONG mỗi cụm ---
         def add_stacked_bar(feat, row, col, legend_group_prefix):
             if feat not in sub_clean.columns or sub_clean[feat].isna().all():
                 return
@@ -345,15 +430,55 @@ def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
                 ), row=row, col=col)
             fig.update_yaxes(title_text="Tỷ lệ (%)", range=[0, 100], row=row, col=col)
 
-        # Vẽ 6 stacked bar
-        add_stacked_bar("VD_type", 2, 1, "vd")
-        add_stacked_bar("service", 2, 2, "sv")
-        add_stacked_bar("day_of_week", 3, 1, "dw")
-        add_stacked_bar("creation_hour", 3, 2, "ch")
-        add_stacked_bar("origin_province", 4, 1, "op")
-        add_stacked_bar("destination_province", 4, 2, "dp")
+        add_stacked_bar("VD_type", 3, 1, "vd")
+        add_stacked_bar("service", 4, 1, "sv")
+        add_stacked_bar("day_of_week", 5, 1, "dw")
+        add_stacked_bar("creation_hour", 6, 1, "ch")
+        add_stacked_bar("origin_province", 7, 1, "op")
+        add_stacked_bar("destination_province", 8, 1, "dp")
 
-        # Vẽ boxplot cho weight
+        # --- CỘT 2 của mỗi hàng feature (MỚI): tỷ lệ % cụm TRONG mỗi giá trị feature (chiều ngược lại) ---
+        def add_cluster_composition(feat, row, col):
+            if feat not in sub_clean.columns or sub_clean[feat].isna().all():
+                return
+            # Dùng SỐ LƯỢNG THÔ (chưa normalize) để có thể gộp nhóm "Khác" đúng cách
+            raw_ct = pd.crosstab(sub_clean[feat], sub_clean["cluster"])
+            top_values = sub_clean[feat].value_counts().head(8).index.tolist()
+
+            other_rows = [r for r in raw_ct.index if r not in top_values]
+            if other_rows:
+                other_counts = raw_ct.loc[other_rows].sum(axis=0)
+                raw_ct = raw_ct.loc[top_values]
+                raw_ct.loc["Khác"] = other_counts
+            else:
+                raw_ct = raw_ct.loc[top_values]
+
+            # Chuẩn hóa về % (mỗi dòng feature/"Khác" sum = 100%) SAU KHI đã gộp counts thô
+            row_sums = raw_ct.sum(axis=1)
+            ct = raw_ct.div(row_sums, axis=0).fillna(0) * 100
+
+            clusters = sorted(sub_clean["cluster"].unique())
+            for clus in clusters:
+                if clus not in ct.columns:
+                    continue
+                fig.add_trace(go.Bar(
+                    x=ct.index.astype(str).tolist(),
+                    y=ct[clus].values.tolist(),
+                    name=f"Cụm {clus}",
+                    marker_color=cluster_colors[clus % len(cluster_colors)],
+                    showlegend=False,
+                    hovertemplate=f"Cụm {clus}<br>%{{x}}<br>%{{y:.1f}}%<extra></extra>"
+                ), row=row, col=col)
+            fig.update_yaxes(title_text="Tỷ lệ (%)", range=[0, 100], row=row, col=col)
+
+        add_cluster_composition("VD_type", 3, 2)
+        add_cluster_composition("service", 4, 2)
+        add_cluster_composition("day_of_week", 5, 2)
+        add_cluster_composition("creation_hour", 6, 2)
+        add_cluster_composition("origin_province", 7, 2)
+        add_cluster_composition("destination_province", 8, 2)
+
+        # --- HÀNG 9: BOXPLOT WEIGHT ---
         if "actual_weight" in sub_clean.columns:
             box_colors = ["#2563EB", "#E11D48", "#10B981", "#F59E0B", "#8B5CF6",
                           "#06B6D4", "#F97316", "#EC4899"]
@@ -369,12 +494,12 @@ def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
                     boxmean=True,
                     showlegend=False,
                     hovertemplate=f"Cụm {c}<br>Weight: %{{y:.1f}} kg<extra></extra>"
-                ), row=5, col=1)
-            fig.update_yaxes(title_text="Khối lượng (kg)", row=5, col=1)
+                ), row=9, col=1)
+            fig.update_yaxes(title_text="Khối lượng (kg)", row=9, col=1)
 
         fig.update_layout(
             barmode="stack",
-            height=1400, width=1100,
+            height=2400, width=1150,
             plot_bgcolor="#FAFAFA", paper_bgcolor="#FFFFFF",
             font=dict(family="Segoe UI, Arial", size=10),
             margin=dict(t=80, b=30, l=50, r=20),
@@ -394,6 +519,7 @@ def analyze_flow(df, pairs, t_col_1, t_col_2, flow_name,
         })
 
     return all_results, flow_pairs
+
 
 def build_full_html(results_by_flow, all_test_results):
     html = """<!DOCTYPE html>
@@ -603,7 +729,7 @@ if __name__ == "__main__":
     print("  LUỒNG 1: KHO GỬI → KHO 1A NGUỒN")
     print("█" * 70)
 
-    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "bill_count",
+    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "tong_kg",
                                         "actual_weight", False)
     print(f"  Top {N_TOP} cặp kho: {len(pairs_o)} cặp")
 
@@ -619,7 +745,7 @@ if __name__ == "__main__":
     print("  LUỒNG 2: KHO 1A ĐÍCH → KHO NHẬN")
     print("█" * 70)
 
-    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "bill_count",
+    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "tong_kg",
                                         "actual_weight", True)
     print(f"  Top {N_TOP} cặp kho: {len(pairs_d)} cặp")
 

@@ -17,6 +17,9 @@ BINS   = [0, 1, 2, 3, 4, 5, 6, 8, 10, 12, 18, 24, 36, 48, 72, 120, float("inf")]
 LABELS = ["0-1h","1-2h","2-3h","3-4h","4-5h","5-6h","6-8h","8-10h","10-12h",
           "12-18h","18-24h","24-36h","36-48h","48-72h","72-120h",">120h"]
 
+DBSCAN_EPS = 0.5
+DBSCAN_MIN_SAMPLES = 200
+
 BAR_COLOR, VIOLIN_COLOR = "#2563EB", "#1D4ED8"
 N_TOP     = 10
 
@@ -102,9 +105,11 @@ def top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow=False):
     df = df.copy()
     
     if is_dest_flow: 
-        df = df[~df[col_b].isin(EXCLUDED_KHO)] 
+        df = df[~df[col_b].isin(EXCLUDED_KHO)]
+        df = df[df['destination_province'] == "Hải Phòng"]
     else: 
         df = df[~df[col_a].isin(EXCLUDED_KHO)]
+        df = df[df['origin_province'] == "Hải Phòng"]
     df["pair"] = df[col_a].astype(str) + " → " + df[col_b].astype(str)
     
     check_col = col_b if is_dest_flow else col_a
@@ -523,10 +528,10 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
             
             sub2 = sub2[(sub2["y2"] >= 0) & (sub2["y2"] <= 48)].copy()
             
-            # if not sub2.empty:
-            #     q1_2 = sub2["y2"].quantile(0.05)
-            #     q3_2 = sub2["y2"].quantile(0.95)
-            #     sub2 = sub2[(sub2["y2"] >= q1_2) & (sub2["y2"] <= q3_2)].copy()
+            if not sub2.empty:
+                q1_2 = sub2["y2"].quantile(0.01)
+                q3_2 = sub2["y2"].quantile(0.99)
+                sub2 = sub2[(sub2["y2"] >= q1_2) & (sub2["y2"] <= q3_2)].copy()
 
             if not sub2.empty:
                 sub2["_h_bin"] = pd.to_datetime(sub2[t_col_1]).dt.hour
@@ -544,8 +549,8 @@ def build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_labe
                 # add_dt_regression_traces(fig, r, 2, x2_vals, y2_vals, hour_shift)
                 
                 # Sampling nếu quá nhiều điểm
-                if n2 > 10000:
-                    sample_idx2 = sub2.sample(10000, random_state=42).index
+                if n2 > 20000:
+                    sample_idx2 = sub2.sample(20000, random_state=42).index
                     sub2_plot = sub2.loc[sample_idx2]
                 else:
                     sub2_plot = sub2
@@ -733,13 +738,13 @@ def write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, page_title):
     print(f"  ==> {out_file}")
 
 
-def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None, is_dest_flow=False, buu_cuc_set=None, color_col=None):
+def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_weight", time_cols=None, time_labels=None, is_dest_flow=False, buu_cuc_set=None):
     required = {col_a, col_b, "bill_code", wt_col, "time"}
     if time_cols:
         required.update(time_cols)
     validate_columns(df, required, out_file)
 
-    df, top = top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow, buu_cuc_set)
+    df, top = top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow)
     sort_label = "Số bill" if sort_by == "bill_count" else "Tổng kg"
     pairs = top["pair"].tolist()
     if not pairs:
@@ -759,7 +764,7 @@ def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_
             pair_shifts2[pair] = find_optimal_shift(sub2)
 
         fig_violin = build_violin_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts)
-        fig_scatter = build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts, pair_shifts2, color_col=color_col)
+        fig_scatter = build_scatter_fig(df, pairs, time_cols, time_labels, title_prefix, sort_label, pair_shifts, pair_shifts2)
         write_combined_html(fig_bar, fig_violin, fig_scatter, out_file, f"{title_prefix} – Top {N_TOP} {sort_label}")
     else:
         fig_bar.write_html(out_file, include_plotlyjs="cdn")
@@ -768,42 +773,32 @@ def build_all(df, col_a, col_b, sort_by, title_prefix, out_file, wt_col="actual_
 
 if __name__ == "__main__":
     print("Đọc dữ liệu kho...")
-
-    COLOR_COL = "VD_type"  
-    bill_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "bill.csv")
-    print(f"Đọc bill.csv (lấy cột '{COLOR_COL}')...")
-    bill_df = pd.read_csv(bill_path, usecols=["bill_code", COLOR_COL])
-    print(f"  bill.csv: {len(bill_df):,} dòng, {bill_df[COLOR_COL].nunique()} loại {COLOR_COL}")
-
+    bill = pd.read_csv('bill.csv', usecols=['bill_code', 'origin_province', 'destination_province'])
     print("Đọc dữ liệu...")
     df_o = pd.read_csv(os.path.join(INPUT_DIR, "origin_head.csv"))
+    df_o = df_o.merge(bill, on='bill_code', how = 'inner')
     df_d = pd.read_csv(os.path.join(INPUT_DIR, "destination_tail.csv"))
+    df_d = df_d.merge(bill, on='bill_code', how = 'inner')
     print(f"  origin_to_1A : {len(df_o):,} bill")
     print(f"  1A_to_dest   : {len(df_d):,} bill")
-
-    df_o = df_o.merge(bill_df, on="bill_code", how="left")
-    df_d = df_d.merge(bill_df, on="bill_code", how="left")
-    print(f"  Merge {COLOR_COL}: origin matched {df_o[COLOR_COL].notna().sum():,}/{len(df_o):,}, "
-          f"dest matched {df_d[COLOR_COL].notna().sum():,}/{len(df_d):,}")
-
     print(f"\nVẽ top {N_TOP} cặp kho BƯU CỤC NHIỀU BILL nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "bill_count", "Kho gửi → Kho 1A nguồn",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_bill_origin.html"), 
               time_cols=["time_o", "time_o1a"], time_labels=["Giờ ra khỏi Kho đầu", "Giờ đến Kho 1A"],
-              is_dest_flow=False, color_col=COLOR_COL)
+              is_dest_flow=False)
     build_all(df_d, "kho_d1a", "kho_d", "bill_count", "Kho 1A đích → Kho nhận",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_bill_dest.html"), 
               time_cols=["time_d1a", "time_d"], time_labels=["Giờ ra khỏi Kho 1A", "Giờ đến Kho đích"],
-              is_dest_flow=True, color_col=COLOR_COL)
+              is_dest_flow=True)
 
     print(f"\nVẽ top {N_TOP} cặp kho BƯU CỤC NHIỀU KG nhất...")
     build_all(df_o, "kho_o", "kho_o1a", "total_kg", "Kho gửi → Kho 1A nguồn",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_kg_origin.html"), 
               time_cols=["time_o", "time_o1a"], time_labels=["Giờ ra khỏi Kho đầu", "Giờ đến Kho 1A"],
-              is_dest_flow=False, color_col=COLOR_COL)
+              is_dest_flow=False)
     build_all(df_d, "kho_d1a", "kho_d", "total_kg", "Kho 1A đích → Kho nhận",
               os.path.join(OUTPUT_DIR, f"top{N_TOP}_kg_dest.html"), 
               time_cols=["time_d1a", "time_d"], time_labels=["Giờ ra khỏi Kho 1A", "Giờ đến Kho đích"],
-              is_dest_flow=True, color_col=COLOR_COL)
+              is_dest_flow=True)
 
-    print(f"\nXong! 4 file HTML (bar + violin + scatter) đã được lưu. Scatter tô màu theo '{COLOR_COL}'.")
+    print(f"\nXong! 4 file HTML (bar + violin + scatter) đã được lưu.")

@@ -3,7 +3,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 import pandas as pd  
 import numpy as np 
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score 
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, f1_score, recall_score, precision_score
 from sklearn.model_selection import train_test_split  
 from sklearn.ensemble import RandomForestClassifier 
 from sklearn.cluster import DBSCAN 
@@ -11,9 +11,10 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots 
 
 N_TOP = 10 
-DBSCAN_EPS = 0.5 
+DBSCAN_EPS = 0.5
 DBSCAN_MIN_SAMPLES = 150
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_plot")
+CONFIDENCE_THRESHOLD = 0.8
 
 EXCLUDE = [
     'Kho TGDĐ Bảo Hành',
@@ -113,6 +114,8 @@ def run_rf_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
 
         X_df = pd.DataFrame(index = sub_clean.index) 
         cat_cols = ['VD_type', 'service', 'day_of_week', 'creation_hour', 'departure_hour'] 
+        # cat_cols = ['VD_type', 'service', 'day_of_week', 'creation_hour'] 
+
         for c in cat_cols: 
             dummies = pd.get_dummies(sub_clean[c], prefix = c) 
             X_df = pd.concat([X_df, dummies], axis = 1) 
@@ -154,13 +157,32 @@ def run_rf_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         rf.fit(X_train, y_train) 
         print(f"   OOB Score: {rf.oob_score_:.4f}")
 
-        y_pred = rf.predict(X_test) 
+        y_proba = rf.predict_proba(X_test)
+        max_proba = np.max(y_proba, axis=1)
+        max_idx = np.argmax(y_proba, axis=1)
+        raw_pred = rf.classes_[max_idx]
+
+        y_pred = np.where(max_proba >= CONFIDENCE_THRESHOLD, raw_pred, -1)
+        coverage_rate = np.mean(max_proba >= CONFIDENCE_THRESHOLD)
+        null_rate = np.mean(max_proba < CONFIDENCE_THRESHOLD)
+        n_null = np.sum(max_proba < CONFIDENCE_THRESHOLD)
+
         acc = accuracy_score(y_test, y_pred) 
         f1_w = f1_score(y_test, y_pred, average = 'weighted') 
         f1_m = f1_score(y_test, y_pred, average= "macro") 
+        rec_m = recall_score(y_test, y_pred, average="macro", zero_division=0)
+        rec_w = recall_score(y_test, y_pred, average="weighted", zero_division=0)
+        pre_m = precision_score(y_test, y_pred, average="macro", zero_division=0)
+        pre_w = precision_score(y_test, y_pred, average="weighted", zero_division=0)
+        print(f"   Threshold: {CONFIDENCE_THRESHOLD}")
+        print(f"   Coverage Rate (>= {CONFIDENCE_THRESHOLD}): {coverage_rate:.4f} ({coverage_rate*100:.2f}%)")
+        print(f"   Null Rate (< {CONFIDENCE_THRESHOLD}): {null_rate:.4f} ({null_rate*100:.2f}%) [{n_null:,}/{len(y_test):,} mẫu test]")
         print(f"   Accuracy score: {acc:.4f}") 
         print(f"   F1 score: {f1_w:.4f}") 
-        
+        print(f"   Recall macro: {rec_m:.4f}")
+        print(f"   Recall weighted: {rec_w:.4f}")
+        print(f"   Precision macro: {pre_m:.4f}")
+        print(f"   Precision weighted: {pre_w:.4f}")
         classes = np.unique(y)
         clc_report = classification_report(y_test, y_pred, labels=classes, output_dict = True, zero_division=0) 
         cm = confusion_matrix(y_test, y_pred, labels=classes) 
@@ -188,16 +210,28 @@ def run_rf_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             "n_samples": len(X_df),
             "n_features": X_df.shape[1],
             "n_clusters": len(np.unique(y)),
+            "coverage_rate": coverage_rate,
+            "null_rate": null_rate,
             "accuracy": acc,
             "f1_weighted": f1_w,
-            "f1_macro": f1_m
+            "f1_macro": f1_m,
+            "recall_macro": rec_m,
+            "recall_weighted": rec_w,
+            "precision_macro": pre_m,
+            "precision_weighted": pre_w
         })
         
         flow_reports.append({
             "pair": pair,
+            "coverage_rate": coverage_rate,
+            "null_rate": null_rate,
             "accuracy": acc,
             "f1": f1_w,
             "f1_macro": f1_m,
+            "recall_macro": rec_m,
+            "recall_weighted": rec_w,
+            "precision_macro": pre_m,
+            "precision_weighted": pre_w,
             "n_samples": len(X_df),
             "fi_df": feat_importances, 
             "cm": cm,
@@ -244,7 +278,7 @@ def build_html_report(results_by_flow, summary_df):
 </style>
 </head><body>
 <h1> Random Forest: Phân loại cụm giờ đến</h1>
-<p class="subtitle">Sử dụng Feature Engineering (One-Hot, Top 10 Tỉnh) & Random Forest Classifier</p>
+<p class="subtitle">Sử dụng Feature Engineering & Random Forest Classifier</p>
 """
     # ── Summary Table ──
     if not summary_df.empty:
@@ -255,9 +289,15 @@ def build_html_report(results_by_flow, summary_df):
                 <td>{row['flow']}</td>
                 <td>{int(row['n_samples']):,}</td>
                 <td>{int(row['n_clusters'])}</td>
+                <td><b>{row['coverage_rate']*100:.1f}%</b></td>
+                <td><span style="color:#e11d48;font-weight:600">{row['null_rate']*100:.1f}%</span></td>
                 <td>{row['accuracy']:.4f}</td>
                 <td><b>{row['f1_weighted']:.4f}</b></td>
                 <td><b>{row['f1_macro']:.4f}</b></td>
+                <td><b>{row['recall_macro']:.4f}</b></td>
+                <td><b>{row['recall_weighted']:.4f}</b></td>
+                <td><b>{row['precision_macro']:.4f}</b></td>
+                <td><b>{row['precision_weighted']:.4f}</b></td>
             </tr>"""
 
         html += f"""
@@ -269,9 +309,15 @@ def build_html_report(results_by_flow, summary_df):
       <th onclick="sortTable(1)" title="Nhấn để sắp xếp">Luồng ↕</th>
       <th onclick="sortTable(2)" title="Nhấn để sắp xếp">Số mẫu ↕</th>
       <th onclick="sortTable(3)" title="Nhấn để sắp xếp">Số cụm ↕</th>
-      <th onclick="sortTable(4)" title="Nhấn để sắp xếp">Accuracy ↕</th>
-      <th onclick="sortTable(5)" title="Nhấn để sắp xếp">Weighted F1 ↕</th>
-      <th onclick="sortTable(6)" title="Nhấn để sắp xếp">Macro F1 ↕</th>
+      <th onclick="sortTable(4)" title="Nhấn để sắp xếp">Coverage (≥{CONFIDENCE_THRESHOLD}) ↕</th>
+      <th onclick="sortTable(5)" title="Nhấn để sắp xếp">Null (<{CONFIDENCE_THRESHOLD}) ↕</th>
+      <th onclick="sortTable(6)" title="Nhấn để sắp xếp">Accuracy ↕</th>
+      <th onclick="sortTable(7)" title="Nhấn để sắp xếp">Weighted F1 ↕</th>
+      <th onclick="sortTable(8)" title="Nhấn để sắp xếp">Macro F1 ↕</th>
+      <th onclick="sortTable(9)" title="Nhấn để sắp xếp">Macro Recall ↕</th>
+      <th onclick="sortTable(10)" title="Nhấn để sắp xếp">Weighted Recall ↕</th>
+      <th onclick="sortTable(11)" title="Nhấn để sắp xếp">Macro Precision ↕</th>
+      <th onclick="sortTable(12)" title="Nhấn để sắp xếp">Weighted Precision ↕</th>
     </tr></thead>
     <tbody>{summary_rows}</tbody>
   </table>
@@ -331,6 +377,10 @@ def build_html_report(results_by_flow, summary_df):
       <span class="meta-badge">Acc: {rep['accuracy']:.3f}</span>
       <span class="meta-badge">W-F1: {rep['f1']:.3f}</span>
       <span class="meta-badge">M-F1: {rep['f1_macro']:.3f}</span>
+      <span class="meta-badge">M-Rec: {rep['recall_macro']:.3f}</span>
+      <span class="meta-badge">W-Rec: {rep['recall_weighted']:.3f}</span>
+      <span class="meta-badge">M-Pre: {rep['precision_macro']:.3f}</span>
+      <span class="meta-badge">W-Pre: {rep['precision_weighted']:.3f}</span>
     </div>
   </div>
   <div class="pair-body">
@@ -399,8 +449,11 @@ function sortTable(n) {
     return html
 
 if __name__ == "__main__":
+    BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+    bill_path = os.path.join(BASE_DIR, "bill.csv") if os.path.exists(os.path.join(BASE_DIR, "bill.csv")) else "bill.csv"
+    traces_dir = os.path.join(BASE_DIR, "output_all_traces") if os.path.exists(os.path.join(BASE_DIR, "output_all_traces")) else "output_all_traces"
+
     print("Đọc dữ liệu bill...")
-    bill_path = os.path.join("bill.csv")
     bill_df = pd.read_csv(bill_path, usecols=["bill_code", "VD_type", "service",
                                                 "receiving_date", "actual_weight",
                                                 "origin_province", "destination_province",
@@ -413,8 +466,8 @@ if __name__ == "__main__":
     bill_df.loc[bill_df["creation_hour"] == "-1h", "creation_hour"] = "N/A"
 
     print("Đọc dữ liệu traces...")
-    df_o = pd.read_csv(os.path.join("output_all_traces", "origin_head.csv"))
-    df_d = pd.read_csv(os.path.join("output_all_traces", "destination_tail.csv"))
+    df_o = pd.read_csv(os.path.join(traces_dir, "origin_head.csv"))
+    df_d = pd.read_csv(os.path.join(traces_dir, "destination_tail.csv"))
 
     merge_cols = ["bill_code", "VD_type", "service", "day_of_week", "actual_weight",
                   "origin_province", "destination_province", "creation_hour"]
