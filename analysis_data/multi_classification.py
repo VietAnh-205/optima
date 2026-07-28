@@ -1,27 +1,74 @@
 """
-Pipeline dự đoán Giờ đến (Offset từ ngày gửi).
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          MULTI-STRATEGY REGRESSION PIPELINE – Ghi chú giải thích           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
 
-Với mỗi cặp kho:
-  1. DBSCAN phân cụm trên y_offset
-  2. Train/Test split 80/20 (stratify theo cluster)
-  3. Training: Fit regression per cluster (LR, RF, LGBM) x 2 feature options
-  4. Inference: 3 chiến lược chọn cụm x 2 feature options x 3 regression models
-  5. Đánh giá: MAE, RMSE, R², MAPE trên 2 scope (All, Dominant Cluster)
+ MỤC TIÊU
+   Dự đoán y_offset = số giờ từ lúc gửi hàng đến khi đến kho đích,
+   áp dụng cho Top-10 cặp kho theo lưu lượng bill.
+
+ PIPELINE (với mỗi cặp kho)
+   Bước 1 │ DBSCAN clustering trên y_offset
+           │   → Phân nhóm tự động các khung giờ đến thực tế
+           │   → Noise (cluster = -1) bị loại bỏ
+           │   → Cụm được đánh số lại 0, 1, 2... theo thứ tự giờ tăng dần
+   Bước 2 │ Train/Test split 80/20 (stratify theo cluster)
+   Bước 3 │ Train Regression per cluster
+           │   → 3 mô hình: LR (Linear), RF (RandomForest), LGBM (LightGBM)
+           │   → 2 bộ features: Option 1 (chỉ giờ xuất phát), Option 2 (full)
+           │   → Mỗi cụm có bộ model riêng
+   Bước 4 │ Inference – 3 chiến lược chọn cụm
+           │   Cách 1 (Dominant Cluster): Với mỗi khung giờ, chọn cụm chiếm
+           │     đa số trong training → đơn giản, không cần ML, ổn định
+           │   Cách 2 (ML Classifier): RandomForest classifier dự đoán cụm
+           │     từ full features → linh hoạt nhưng có thể sai cụm
+           │   Cách 3 (Hybrid): Dùng ML nếu xác suất >= 90%, còn lại dùng Cách 1
+           │     → kết hợp ưu điểm cả hai
+   Bước 5 │ Đánh giá trên 2 scope
+           │   All      : Toàn bộ test set
+           │   Dominant : Chỉ bill thuộc cụm lớn nhất (dominant cluster)
+
+ CÁC TRƯỜNG THÔNG TIN TRONG OUTPUT
+   flow             : Luồng vận chuyển (Luồng 1: Kho gửi→1A, Luồng 2: 1A→Kho nhận)
+   pair             : Cặp kho (Kho A -> Kho B)
+   cluster_selection: Chiến lược chọn cụm (Cách 1/2/3)
+   feature_option   : Bộ features dùng cho regression (Option 1/2)
+   regression_model : Mô hình hồi quy (LR / RF / LGBM)
+   eval_scope       : Phạm vi đánh giá (All / Dominant)
+   n_samples_test   : Số bill trong tập test
+   MAE              : Mean Absolute Error – sai số trung bình tuyệt đối (giờ)
+   RMSE             : Root Mean Squared Error – nhạy cảm với outlier (giờ)
+   R²               : Hệ số xác định – càng gần 1 càng tốt (âm = tệ hơn đoán trung bình)
+   MAPE             : Mean Absolute Percentage Error – sai số % so với giá trị thực
+
+ LƯU Ý VỀ LR
+   Linear Regression không có giới hạn output. Nếu ML Classifier gán nhầm cluster,
+   LR có thể extrapolate ra ngoài vùng train → giá trị vọt cực lớn.
+   → Đã xử lý bằng clip output trong khoảng [y_min-2, y_max+2] của cluster tương ứng.
+   RF và LGBM không bị vấn đề này vì là tree-based model (output bounded).
+
+ LƯU MODEL
+   Models được lưu vào thư mục output_plot/saved_models/<pair_slug>/
+   dưới dạng .joblib để có thể tái sử dụng mà không cần train lại.
+   Xem hàm save_models() và load_models() trong file này.
 
 Output:
-  - CSV:  output_plot/multi_regression_summary.csv
-  - HTML: output_plot/multi_regression.html
+  - CSV:     output_plot/multi_classification_summary.csv
+  - HTML:    output_plot/multi_classification.html
+  - Models:  output_plot/saved_models/<pair_slug>/*.joblib
 """
 
-import sys, os
+import sys, os, re
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 import pandas as pd
 import numpy as np
+import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, LightGBMRegressor
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from lightgbm import LGBMRegressor
 from sklearn.cluster import DBSCAN
 from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
                              accuracy_score, f1_score)
@@ -29,10 +76,11 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ── Cấu hình ────────────────────────────────────────────────────────────
-N_TOP = 10
+N_TOP = 6
 DBSCAN_EPS = 0.5
-DBSCAN_MIN_SAMPLES = 150    
+DBSCAN_MIN_SAMPLES = 150
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_plot")
+MODELS_DIR = os.path.join(OUTPUT_DIR, "saved_models")  # Thư mục lưu model
 HYBRID_THRESHOLD = 0.9  # Ngưỡng xác suất cho chiến lược Hybrid
 
 EXCLUDE = [
@@ -51,23 +99,56 @@ TIME_SLOTS = {
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
-def get_top_pairs(df, col_a, col_b, sort_by, is_dest_flow):
-    """Lấy top N cặp kho (giữ nguyên logic classification.py)"""
+def get_top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow):
+    """Lấy top 10 cặp tỉnh có số lượng bill lớn nhất, mỗi cặp tỉnh lấy top 5 cặp kho"""
     df = df.copy()
     if is_dest_flow:
         df = df[~df[col_b].isin(EXCLUDE)]
     else:
         df = df[~df[col_a].isin(EXCLUDE)]
+    key = "so_bill" if sort_by == "bill_count" else "tong_kg"
+    # Đọc danh sách kho để lấy thông tin tỉnh
+    wh_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "warehouse.csv")
+    wh = pd.read_csv(wh_path, usecols=['name', 'province'])
+    
+    # Merge province A
+    df = pd.merge(df, wh, left_on=[col_a], right_on=['name'], how='left')
+    df = df.drop(columns=['name']).rename(columns={'province': f'{col_a}_province'})
+    
+    # Merge province B
+    df = pd.merge(df, wh, left_on=[col_b], right_on=['name'], how='left')
+    df = df.drop(columns=['name']).rename(columns={'province': f'{col_b}_province'})
 
-    df['pair'] = df[col_a].astype(str) + ' -> ' + df[col_b].astype(str)
-    check_col = col_b if is_dest_flow else col_a
-    agg = df.groupby(['pair', check_col]).agg(
+    df["pair"] = df[col_a].astype(str) + " (" + df[f'{col_a}_province'].astype(str) + ") → " + df[col_b].astype(str) + " (" + df[f'{col_b}_province'].astype(str) + ")"
+
+    # Lọc dữ liệu theo luồng
+    if is_dest_flow:
+        df = df[df['destination_province'] == df[f'{col_b}_province']]
+    else:
+        df = df[df['origin_province'] == df[f'{col_a}_province']]
+
+    # Lấy top cặp tỉnh theo số lượng bill
+    agg_prov = df.groupby([f'{col_a}_province', f'{col_b}_province']).agg(
         so_bill=('bill_code', 'nunique'),
-        tong_kg=('actual_weight', 'sum')
+        tong_kg=(wt_col, 'sum')
     ).reset_index()
-    key = "so_bill" if sort_by == 'bill_count' else "tong_kg"
-    top = agg.nlargest(N_TOP, key)
-    return df, top['pair'].tolist()
+    top_prov = agg_prov.nlargest(N_TOP, key)
+    
+    # Lấy top cặp kho cho mỗi cặp tỉnh
+    final_pairs = []
+    for _, row in top_prov.iterrows():
+        prov_a = row[f'{col_a}_province']
+        prov_b = row[f'{col_b}_province']
+        
+        sub_df = df[(df[f'{col_a}_province'] == prov_a) & (df[f'{col_b}_province'] == prov_b)]
+        agg_kho = sub_df.groupby(["pair"]).agg(
+            so_bill=('bill_code', 'nunique'),
+            tong_kg=(wt_col, 'sum')
+        ).reset_index()
+        top_kho = agg_kho.nlargest(3, key)
+        final_pairs.extend(top_kho['pair'].tolist())
+        
+    return df, final_pairs
 
 
 def transform_province(series, top=10):
@@ -98,6 +179,41 @@ def compute_regression_metrics(y_true, y_pred):
     else:
         mape = np.nan
     return {"MAE": mae, "RMSE": rmse, "R2": r2, "MAPE": mape}
+
+
+def _pair_slug(pair: str) -> str:
+    """Chuyển tên cặp kho thành tên thư mục hợp lệ"""
+    return re.sub(r'[^\w]+', '_', pair).strip('_')[:80]
+
+
+def save_models(pair, regression_models, clf, flow_name):
+    """
+    Lưu toàn bộ model của một cặp kho vào đĩa.
+    Cấu trúc: saved_models/<pair_slug>/regression_models.joblib
+                                       classifier.joblib
+                                       meta.joblib
+    """
+    slug = _pair_slug(pair)
+    pair_dir = os.path.join(MODELS_DIR, slug)
+    os.makedirs(pair_dir, exist_ok=True)
+    joblib.dump(regression_models, os.path.join(pair_dir, "regression_models.joblib"))
+    joblib.dump(clf, os.path.join(pair_dir, "classifier.joblib"))
+    joblib.dump({"pair": pair, "flow": flow_name}, os.path.join(pair_dir, "meta.joblib"))
+    print(f"  [Lưu model] → {pair_dir}")
+
+
+def load_models(pair):
+    """
+    Tải lại model đã lưu. Trả về (regression_models, clf) hoặc (None, None) nếu chưa có.
+    """
+    slug = _pair_slug(pair)
+    pair_dir = os.path.join(MODELS_DIR, slug)
+    reg_path = os.path.join(pair_dir, "regression_models.joblib")
+    clf_path = os.path.join(pair_dir, "classifier.joblib")
+    if os.path.exists(reg_path) and os.path.exists(clf_path):
+        print(f"  [Load model] ← {pair_dir}")
+        return joblib.load(reg_path), joblib.load(clf_path)
+    return None, None
 
 
 # ── Hàm chính ───────────────────────────────────────────────────────────
@@ -227,49 +343,58 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         c_train, c_test = clusters[idx_train], clusters[idx_test]
         dep_hour_test = X1_test['departure_hour_numeric'].values
 
-        # ══ TRAINING ══
+        # ══ TRAINING hoặc LOAD MODEL ══
+        regression_models, clf = load_models(pair)
 
-        # --- 1. Fit Regression per Cluster ---
-        regression_models = {}  # key: (cluster, model_name, option) -> model
-        model_specs = [("LR", LinearRegression)]
-        model_specs.append(("RF", lambda: RandomForestRegressor(
-            n_estimators=100, max_depth=15, n_jobs=-1, random_state=42)))
-        model_specs.append(("LGBM", lambda: LightGBMRegressor(
-            n_estimators=100, max_depth=15, verbose=-1, random_state=42, n_jobs=-1)))
+        if regression_models is not None and clf is not None:
+            # ── Đã có model lưu sẵn → bỏ qua training, dùng lại ──
+            print(f"  [Cache hit] Dùng model đã lưu, bỏ qua training.")
+            clf_proba_test = clf.predict_proba(X2_test)
+            clf_pred_test = clf.classes_[np.argmax(clf_proba_test, axis=1)]
+            clf_max_proba_test = np.max(clf_proba_test, axis=1)
+        else:
+            # ── Chưa có model → train mới ──
 
-        unique_clusters = sorted(np.unique(c_train))
-        print(f"\n  Training regression models cho {len(unique_clusters)} cụm...")
+            # --- 1. Fit Regression per Cluster ---
+            regression_models = {}  # key: (cluster, model_name, option) -> model
+            model_specs = [("LR", LinearRegression)]
+            model_specs.append(("RF", lambda: RandomForestRegressor(
+                n_estimators=100, max_depth=15, n_jobs=-1, random_state=42)))
+            model_specs.append(("LGBM", lambda: LGBMRegressor(
+                n_estimators=100, max_depth=15, verbose=-1, random_state=42, n_jobs=-1)))
 
-        for clus in unique_clusters:
-            mask_c = c_train == clus
-            if mask_c.sum() < 5:
-                continue
+            unique_clusters = sorted(np.unique(c_train))
+            print(f"\n  Training regression models cho {len(unique_clusters)} cụm...")
 
-            y_c = y_train[mask_c]
+            for clus in unique_clusters:
+                mask_c = c_train == clus
+                if mask_c.sum() < 5:
+                    continue
 
-            for opt_name, opt_X_train in [("Opt1", X1_train), ("Opt2", X2_train)]:
-                X_c = opt_X_train.iloc[mask_c.nonzero()[0]] if isinstance(mask_c, np.ndarray) else opt_X_train[mask_c]
+                y_c = y_train[mask_c]
 
-                for model_name, model_factory in model_specs:
-                    try:
-                        model = model_factory() if callable(model_factory) and not isinstance(model_factory, type) else model_factory()
-                        model.fit(X_c, y_c)
-                        regression_models[(clus, model_name, opt_name)] = model
-                    except Exception as e:
-                        print(f"     Lỗi fit {model_name} cho cụm {clus} {opt_name}: {e}")
+                for opt_name, opt_X_train in [("Opt1", X1_train), ("Opt2", X2_train)]:
+                    X_c = opt_X_train.iloc[mask_c.nonzero()[0]] if isinstance(mask_c, np.ndarray) else opt_X_train[mask_c]
 
-        print(f"  Đã train {len(regression_models)} regression models")
+                    for model_name, model_factory in model_specs:
+                        try:
+                            model = model_factory() if callable(model_factory) and not isinstance(model_factory, type) else model_factory()
+                            model.fit(X_c, y_c)
+                            regression_models[(clus, model_name, opt_name)] = model
+                        except Exception as e:
+                            print(f"     Lỗi fit {model_name} cho cụm {clus} {opt_name}: {e}")
 
-        # --- 2. Fit Classifier (cho Cách 2 & 3) ---
-        # Dùng Option 2 features cho classifier
-        clf = RandomForestClassifier(
-            n_estimators=100, class_weight="balanced",
-            n_jobs=-1, max_depth=15, random_state=42
-        )
-        clf.fit(X2_train, c_train)
-        clf_proba_test = clf.predict_proba(X2_test)
-        clf_pred_test = clf.classes_[np.argmax(clf_proba_test, axis=1)]
-        clf_max_proba_test = np.max(clf_proba_test, axis=1)
+            print(f"  Đã train {len(regression_models)} regression models")
+
+            # --- 2. Fit Classifier (cho Cách 2 & 3) ---
+            clf = RandomForestClassifier(
+                n_estimators=100, class_weight="balanced",
+                n_jobs=-1, max_depth=15, random_state=42
+            )
+            clf.fit(X2_train, c_train)
+            clf_proba_test = clf.predict_proba(X2_test)
+            clf_pred_test = clf.classes_[np.argmax(clf_proba_test, axis=1)]
+            clf_max_proba_test = np.max(clf_proba_test, axis=1)
 
         clf_acc = accuracy_score(c_test, clf_pred_test)
         clf_f1 = f1_score(c_test, clf_pred_test, average='weighted', zero_division=0)
@@ -286,13 +411,13 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             else:
                 slot_cluster_map[slot_name] = dominant_cluster
 
-        print(f"  Khung giờ → Cụm: {slot_cluster_map}")
+        print(f"  Khung giờ → Cụm dominant: {slot_cluster_map}")
 
         # ══ INFERENCE ══
         print(f"\n  Inference trên {len(idx_test):,} bills test...")
 
         # Bước 1: Chọn cụm cho mỗi bill test
-        # Cách 1: Khung giờ
+        # Cách 1 (Dominant Cluster): Với mỗi khung giờ, lấy cụm chiếm đa số trong training
         chosen_c1 = np.array([
             slot_cluster_map.get(get_time_slot(h), dominant_cluster)
             for h in dep_hour_test
@@ -312,7 +437,7 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
 
         # Bước 2: Dự đoán y_offset
         cluster_selections = {
-            "Cách 1 (Khung giờ)": chosen_c1,
+            "Cách 1 (Dominant Cluster)": chosen_c1,
             "Cách 2 (ML Classifier)": chosen_c2,
             "Cách 3 (Hybrid)": chosen_c3,
         }
@@ -332,18 +457,40 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
                     # Dự đoán y_offset cho mỗi bill
                     y_pred = np.full(len(y_test), np.nan)
 
-                    for i in range(len(y_test)):
-                        clus = chosen_clusters[i]
-                        key = (clus, reg_name, opt_key)
-                        if key in regression_models:
-                            x_i = X_test_opt.iloc[[i]]
-                            y_pred[i] = regression_models[key].predict(x_i)[0]
+                    # ── Tối ưu inference: Predict theo batch từng cụm (Vectorized) ──
+                    # Precompute clip bounds cho từng cluster để tránh tính lại trong loop
+                    clip_bounds = {}
+                    for clus_id in np.unique(chosen_clusters):
+                        cm = c_train == clus_id
+                        if cm.any():
+                            clip_bounds[clus_id] = (y_train[cm].min() - 2, y_train[cm].max() + 2)
                         else:
-                            # Fallback: dùng dominant cluster model
-                            fallback_key = (dominant_cluster, reg_name, opt_key)
-                            if fallback_key in regression_models:
-                                x_i = X_test_opt.iloc[[i]]
-                                y_pred[i] = regression_models[fallback_key].predict(x_i)[0]
+                            clip_bounds[clus_id] = (-2, 50)
+
+                    # Duyệt qua các cụm được chọn trong test set
+                    for clus_id in np.unique(chosen_clusters):
+                        idx_clus = np.where(chosen_clusters == clus_id)[0]
+                        if len(idx_clus) == 0:
+                            continue
+
+                        # Xác định model key
+                        key = (clus_id, reg_name, opt_key)
+                        used_clus = clus_id
+                        if key not in regression_models:
+                            # Fallback sang dominant cluster
+                            key = (dominant_cluster, reg_name, opt_key)
+                            used_clus = dominant_cluster
+                        
+                        if key not in regression_models:
+                            continue
+
+                        # Predict nguyên batch cho tất cả các bill thuộc cụm này
+                        X_batch = X_test_opt.iloc[idx_clus]
+                        y_raw_batch = regression_models[key].predict(X_batch)
+
+                        # Clip và gán kết quả
+                        lo, hi = clip_bounds.get(used_clus, (-2, 50))
+                        y_pred[idx_clus] = np.clip(y_raw_batch, lo, hi)
 
                     # Đánh giá
                     valid = ~np.isnan(y_pred)
@@ -414,6 +561,9 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             "hybrid_ml_rate": hybrid_ml_rate,
         })
 
+        # ── Lưu model ra đĩa ──
+        save_models(pair, regression_models, clf, flow_name)
+
     return all_results, flow_pair_reports
 
 
@@ -434,10 +584,23 @@ def build_html_report(results_by_flow, summary_df):
   .summary-card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 24px;
                     box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
   .summary-card h2 { font-size: 16px; margin-bottom: 12px; color: #334155; }
+  .note-card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 20px;
+                 margin-bottom: 24px; font-size: 13px; line-height: 1.6; color: #334155; }
+  .note-card h2 { font-size: 16px; margin-bottom: 12px; color: #1e293b; border-bottom: 1px solid #e2e8f0; padding-bottom: 8px; }
+  .note-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .note-section { margin-bottom: 12px; }
+  .note-section b { color: #1e293b; display: block; margin-bottom: 4px; font-weight: 600; }
+  .avg-card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 24px;
+                box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
+  .avg-card h2 { font-size: 16px; margin-bottom: 12px; color: #334155; border-bottom: 1px solid #e2e8f0; padding-bottom: 8px; }
+  .avg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .avg-table-wrap { overflow-x: auto; }
+  .avg-table-wrap h3 { font-size: 12px; font-weight: 700; color: #475569; margin-bottom: 6px;
+                        border-left: 3px solid #3b82f6; padding-left: 8px; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { background: #f8fafc; padding: 8px 10px; text-align: left; font-weight: 600;
        border-bottom: 2px solid #e2e8f0; color: #475569; user-select: none; }
-  th:hover { background: #e2e8f0; cursor: pointer; }
+  th.sortable:hover { background: #e2e8f0; cursor: pointer; }
   td { padding: 6px 10px; border-bottom: 1px solid #f1f5f9; }
   tr:hover td { background: #f8fafc; }
   .pair-card { background: white; border-radius: 10px; margin-bottom: 20px; overflow: hidden;
@@ -454,14 +617,104 @@ def build_html_report(results_by_flow, summary_df):
   .chart-container { min-height: 400px; }
   .section-title { font-size: 14px; font-weight: 700; color: #334155; margin: 16px 0 8px; }
   .highlight { background: #fef3c7; padding: 2px 6px; border-radius: 3px; font-weight: 700; }
+  td.best { background: #d1fae5; font-weight: 700; color: #065f46; }
 </style>
 </head><body>
-<h1> Multi-Strategy Regression Pipeline</h1>
+<h1>Multi-Strategy Regression Pipeline</h1>
 <p class="subtitle">So sánh tổ hợp: 3 chiến lược chọn cụm × 2 feature options × 3 mô hình hồi quy × 2 evaluation scopes</p>
+
+<div class="note-card">
+  <h2>Hướng dẫn đọc báo cáo</h2>
+  <div class="note-grid">
+    <div>
+      <div class="note-section"><b>Pipeline (mỗi cặp kho)</b>
+        Bước 1: DBSCAN phân cụm y_offset → Bước 2: Train/Test 80/20 →
+        Bước 3: Train Regression per cluster (LR/RF/LGBM × Opt1/Opt2) →
+        Bước 4: Inference 3 chiến lược → Bước 5: Đánh giá All & Dominant
+      </div>
+      <div class="note-section"><b>Chiến lược chọn cụm</b>
+        <u>Cách 1 (Dominant Cluster)</u>: Với mỗi khung giờ, dùng cụm chiếm đa số trong training – đơn giản, ổn định<br>
+        <u>Cách 2 (ML Classifier)</u>: RandomForest tự phân loại cụm từ full features – linh hoạt hơn<br>
+        <u>Cách 3 (Hybrid)</u>: Dùng ML nếu xác suất ≥ 90%, còn lại dùng Cách 1
+      </div>
+    </div>
+    <div>
+      <div class="note-section"><b>Feature Options</b>
+        <u>Option 1 (Hour)</u>: Chỉ dùng giờ xuất phát (departure_hour_numeric)<br>
+        <u>Option 2 (Full)</u>: Giờ + loại VD + dịch vụ + ngày trong tuần + giờ tạo đơn + tỉnh + trọng lượng
+      </div>
+      <div class="note-section"><b>Metrics</b>
+        <u>MAE</u>: Sai số trung bình (giờ) – nhỏ hơn = tốt hơn<br>
+        <u>RMSE</u>: Nhạy với outlier (giờ) – nhỏ hơn = tốt hơn<br>
+        <u>R²</u>: Mức độ giải thích biến động – càng gần 1 càng tốt (âm = tệ hơn đoán trung bình)<br>
+        <u>MAPE</u>: Sai số phần trăm – nhỏ hơn = tốt hơn<br>
+        <u>All</u>: Đánh giá toàn bộ test | <u>Dominant</u>: Chỉ cụm lớn nhất
+      </div>
+    </div>
+  </div>
+</div>
 """
 
-    # ── Summary Table ──
+    # ── Summary Table + Avg Tables ──
     if not summary_df.empty:
+        # Lọc bỏ outlier cực đoan trước khi tính avg (|MAE| > 1000 coi là artifact)
+        df_valid = summary_df[summary_df['MAE'].abs() < 1000].copy()
+
+        def _avg_table(df, group_col, label):
+            """Tạo HTML table trung bình metrics theo 1 cột nhóm (phân tách theo eval_scope)."""
+            if group_col != "eval_scope":
+                grp = df.groupby([group_col, 'eval_scope'])[['MAE', 'RMSE', 'R2', 'MAPE']].mean().reset_index()
+                grp = grp.sort_values(['MAE', 'eval_scope'])
+                rows = ""
+                for _, r in grp.iterrows():
+                    rows += (f"<tr><td><b>{r[group_col]}</b></td><td>{r['eval_scope']}</td>"
+                             f"<td>{r['MAE']:.3f}</td><td>{r['RMSE']:.3f}</td>"
+                             f"<td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
+                return f"""
+<div class="avg-table-wrap">
+  <h3>{label}</h3>
+  <table>
+    <thead><tr><th>{group_col}</th><th>Scope</th><th>Avg MAE</th><th>Avg RMSE</th><th>Avg R²</th><th>Avg MAPE</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>"""
+            else:
+                grp = df.groupby(group_col)[['MAE', 'RMSE', 'R2', 'MAPE']].mean().reset_index()
+                grp = grp.sort_values('MAE')
+                rows = ""
+                for _, r in grp.iterrows():
+                    rows += (f"<tr><td><b>{r[group_col]}</b></td>"
+                             f"<td>{r['MAE']:.3f}</td><td>{r['RMSE']:.3f}</td>"
+                             f"<td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
+                return f"""
+<div class="avg-table-wrap">
+  <h3>{label}</h3>
+  <table>
+    <thead><tr><th>{group_col}</th><th>Avg MAE</th><th>Avg RMSE</th><th>Avg R²</th><th>Avg MAPE</th></tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>"""
+
+        avg_html = ""
+        for col, lbl in [
+            ("flow",               "Theo Luồng"),
+            ("cluster_selection",  "Theo Chiến lược chọn cụm"),
+            ("feature_option",     "Theo Feature Option"),
+            ("regression_model",   "Theo Regression Model"),
+            ("eval_scope",         "Theo Eval Scope"),
+        ]:
+            if col in df_valid.columns:
+                avg_html += _avg_table(df_valid, col, lbl)
+
+        html += f"""
+<div class="avg-card">
+  <h2>Trung bình hiệu suất theo từng nhóm
+    <span style="font-size:11px;font-weight:400;color:#64748b;"> (loại bỏ outlier MAE &gt; 1000h)</span>
+  </h2>
+  <div class="avg-grid">{avg_html}</div>
+</div>
+"""
+
         summary_rows = ""
         for _, row in summary_df.sort_values("MAE", ascending=True).iterrows():
             mae_str = f"{row['MAE']:.2f}" if not pd.isna(row['MAE']) else "N/A"
@@ -484,20 +737,20 @@ def build_html_report(results_by_flow, summary_df):
 
         html += f"""
 <div class="summary-card">
-  <h2> Bảng tổng hợp so sánh tất cả tổ hợp chiến lược</h2>
+  <h2>Bảng tổng hợp so sánh tất cả tổ hợp chiến lược</h2>
   <table id="summaryTable">
     <thead><tr>
-      <th onclick="sortTable(0)">Cặp Kho ↕</th>
-      <th onclick="sortTable(1)">Luồng ↕</th>
-      <th onclick="sortTable(2)">Chọn Cụm ↕</th>
-      <th onclick="sortTable(3)">Features ↕</th>
-      <th onclick="sortTable(4)">Regression ↕</th>
-      <th onclick="sortTable(5)">Eval Scope ↕</th>
-      <th onclick="sortTable(6)">N Test ↕</th>
-      <th onclick="sortTable(7)">MAE (h) ↕</th>
-      <th onclick="sortTable(8)">RMSE (h) ↕</th>
-      <th onclick="sortTable(9)">R² ↕</th>
-      <th onclick="sortTable(10)">MAPE ↕</th>
+      <th class="sortable" onclick="sortTable(0)">Cặp Kho ↕</th>
+      <th class="sortable" onclick="sortTable(1)">Luồng ↕</th>
+      <th class="sortable" onclick="sortTable(2)">Chọn Cụm ↕</th>
+      <th class="sortable" onclick="sortTable(3)">Features ↕</th>
+      <th class="sortable" onclick="sortTable(4)">Regression ↕</th>
+      <th class="sortable" onclick="sortTable(5)">Eval Scope ↕</th>
+      <th class="sortable" onclick="sortTable(6)">N Test ↕</th>
+      <th class="sortable" onclick="sortTable(7)">MAE (h) ↕</th>
+      <th class="sortable" onclick="sortTable(8)">RMSE (h) ↕</th>
+      <th class="sortable" onclick="sortTable(9)">R² ↕</th>
+      <th class="sortable" onclick="sortTable(10)">MAPE ↕</th>
     </tr></thead>
     <tbody>{summary_rows}</tbody>
   </table>
@@ -582,11 +835,12 @@ def build_html_report(results_by_flow, summary_df):
             )
 
             id_chart = f"chart_{chart_idx}"
-            chart_idx += 1
+            # KHÔNG tăng chart_idx ở đây — phải dùng cùng giá trị trong script bên dưới
 
             # Slot map info
             slot_info = " | ".join([f"{k}: Cụm {v}" for k, v in rep['slot_cluster_map'].items()])
 
+            fig_json = fig.to_json()
             html += f"""
 <div class="pair-card">
   <div class="pair-header">
@@ -600,7 +854,7 @@ def build_html_report(results_by_flow, summary_df):
     </div>
   </div>
   <div class="pair-body">
-    <p class="section-title"> Khung giờ → Cụm (Cách 1): {slot_info}</p>
+    <p class="section-title"> Khung giờ → Cụm dominant (Cách 1): {slot_info}</p>
 
     <div class="grid-2">
       <div>
@@ -630,44 +884,47 @@ def build_html_report(results_by_flow, summary_df):
   </div>
 </div>
 <script>
-var d_{chart_idx} = {fig.to_json()};
+var d_{chart_idx} = {fig_json};
 Plotly.newPlot('{id_chart}', d_{chart_idx}.data, d_{chart_idx}.layout, {{responsive: true}});
 </script>
 """
+            chart_idx += 1  # Tăng SAU khi đã emit script với giá trị hiện tại
 
     # Sort table script
     html += """
 <script>
 function sortTable(n) {
-  var table, rows, switching, i, x, y, shouldSwitch, dir, switchcount = 0;
-  table = document.getElementById("summaryTable");
-  switching = true;
-  dir = "asc";
-  while (switching) {
-    switching = false;
-    rows = table.rows;
-    for (i = 1; i < (rows.length - 1); i++) {
-      shouldSwitch = false;
-      x = rows[i].getElementsByTagName("TD")[n];
-      y = rows[i + 1].getElementsByTagName("TD")[n];
-      let xContent = (x.innerText || x.textContent).replace(/,/g, '').replace(/%/g, '');
-      let yContent = (y.innerText || y.textContent).replace(/,/g, '').replace(/%/g, '');
-      let xNum = parseFloat(xContent);
-      let yNum = parseFloat(yContent);
-      let isNum = !isNaN(xNum) && !isNaN(yNum);
-      if (dir == "asc") {
-        if (isNum ? xNum > yNum : xContent.toLowerCase() > yContent.toLowerCase()) { shouldSwitch = true; break; }
-      } else if (dir == "desc") {
-        if (isNum ? xNum < yNum : xContent.toLowerCase() < yContent.toLowerCase()) { shouldSwitch = true; break; }
-      }
-    }
-    if (shouldSwitch) {
-      rows[i].parentNode.insertBefore(rows[i + 1], rows[i]);
-      switching = true; switchcount++;
-    } else {
-      if (switchcount == 0 && dir == "asc") { dir = "desc"; switching = true; }
-    }
-  }
+  var table = document.getElementById("summaryTable");
+  var tbody = table.querySelector("tbody");
+  var rows = Array.from(tbody.querySelectorAll("tr"));
+
+  // Toggle direction: nếu click cùng cột thì đảo chiều
+  var prevCol = parseInt(table.dataset.sortCol ?? "-1");
+  var prevDir = table.dataset.sortDir || "asc";
+  var dir = (prevCol === n && prevDir === "asc") ? "desc" : "asc";
+  table.dataset.sortDir = dir;
+  table.dataset.sortCol = n;
+
+  // Cập nhật icon trên header
+  var ths = table.querySelectorAll("thead th");
+  ths.forEach(function(th, idx) {
+    var txt = th.textContent.replace(/ [\u2191\u2193\u2195]/g, '').trim();
+    th.textContent = txt + (idx === n ? (dir === "asc" ? " \u2191" : " \u2193") : " \u2195");
+  });
+
+  rows.sort(function(rowA, rowB) {
+    var cellA = rowA.querySelectorAll("td")[n];
+    var cellB = rowB.querySelectorAll("td")[n];
+    if (!cellA || !cellB) return 0;
+    var a = (cellA.innerText || cellA.textContent).replace(/,/g, '').replace(/%/g, '').trim();
+    var b = (cellB.innerText || cellB.textContent).replace(/,/g, '').replace(/%/g, '').trim();
+    var aNum = parseFloat(a);
+    var bNum = parseFloat(b);
+    var cmp = (!isNaN(aNum) && !isNaN(bNum)) ? (aNum - bNum) : a.toLowerCase().localeCompare(b.toLowerCase());
+    return dir === "asc" ? cmp : -cmp;
+  });
+
+  rows.forEach(function(row) { tbody.appendChild(row); });
 }
 </script>
 </body></html>"""
@@ -679,6 +936,7 @@ function sortTable(n) {
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.makedirs(MODELS_DIR, exist_ok=True)
 
     BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
     bill_path = os.path.join(BASE_DIR, "bill.csv")
@@ -714,7 +972,7 @@ if __name__ == "__main__":
     print("\n" + "█" * 70)
     print("  LUỒNG 1: KHO GỬI → KHO 1A NGUỒN")
     print("█" * 70)
-    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "bill_count", False)
+    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "tong_kg", "actual_weight", False)
     res_o, rep_o = run_multi_pipeline(df_o_proc, pairs_o, "time_o", "time_o1a",
                                        "Kho gửi → Kho 1A", is_dest_flow=False)
     all_results.extend(res_o)
@@ -724,7 +982,7 @@ if __name__ == "__main__":
     print("\n" + "█" * 70)
     print("  LUỒNG 2: KHO 1A ĐÍCH → KHO NHẬN")
     print("█" * 70)
-    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "bill_count", True)
+    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "tong_kg", "actual_weight", True)
     res_d, rep_d = run_multi_pipeline(df_d_proc, pairs_d, "time_d1a", "time_d",
                                        "Kho 1A → Kho nhận", is_dest_flow=True)
     all_results.extend(res_d)
@@ -733,13 +991,13 @@ if __name__ == "__main__":
     # ── Xuất kết quả ──
     df_sum = pd.DataFrame(all_results)
     if not df_sum.empty:
-        csv_path = os.path.join(OUTPUT_DIR, "multi_regression_summary.csv")
+        csv_path = os.path.join(OUTPUT_DIR, "multi_classification_summary.csv")
         df_sum.to_csv(csv_path, index=False, encoding="utf-8-sig")
         print(f"\n Đã lưu CSV: {csv_path}")
 
     print("\n Đang tạo HTML Dashboard...")
     html_content = build_html_report(results_by_flow, df_sum if not df_sum.empty else pd.DataFrame())
-    html_path = os.path.join(OUTPUT_DIR, "multi_regression.html")
+    html_path = os.path.join(OUTPUT_DIR, "multi_classification.html")
     with open(html_path, "w", encoding="utf-8") as f:
         f.write(html_content)
     print(f" Đã lưu HTML: {html_path}")
