@@ -593,8 +593,11 @@ def build_html_report(results_by_flow, summary_df):
   .avg-card { background: white; border-radius: 10px; padding: 20px; margin-bottom: 24px;
                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
   .avg-card h2 { font-size: 16px; margin-bottom: 12px; color: #334155; border-bottom: 1px solid #e2e8f0; padding-bottom: 8px; }
-  .avg-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .avg-grid { display: flex; flex-direction: column; gap: 32px; }
+  .avg-row-container { display: flex; flex-direction: column; gap: 16px; border-bottom: 1px solid #e2e8f0; padding-bottom: 24px; }
+  .avg-row-container:last-child { border-bottom: none; padding-bottom: 0; }
   .avg-table-wrap { overflow-x: auto; }
+  .avg-chart-wrap { width: 100%; min-height: 320px; }
   .avg-table-wrap h3 { font-size: 12px; font-weight: 700; color: #475569; margin-bottom: 6px;
                         border-left: 3px solid #3b82f6; padding-left: 8px; }
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
@@ -660,51 +663,160 @@ def build_html_report(results_by_flow, summary_df):
         # Lọc bỏ outlier cực đoan trước khi tính avg (|MAE| > 1000 coi là artifact)
         df_valid = summary_df[summary_df['MAE'].abs() < 1000].copy()
 
-        def _avg_table(df, group_col, label):
-            """Tạo HTML table trung bình metrics theo 1 cột nhóm (phân tách theo eval_scope)."""
+        def _avg_table(df, group_col, label, idx):
+            """Tạo HTML table trung bình metrics theo 1 cột nhóm (phân tách thêm theo luồng và eval_scope)."""
+            cols_to_group = [group_col]
+            if group_col != "flow":
+                cols_to_group.append("flow")
             if group_col != "eval_scope":
-                grp = df.groupby([group_col, 'eval_scope'])[['MAE', 'RMSE', 'R2', 'MAPE']].mean().reset_index()
-                grp = grp.sort_values(['MAE', 'eval_scope'])
-                rows = ""
-                for _, r in grp.iterrows():
-                    rows += (f"<tr><td><b>{r[group_col]}</b></td><td>{r['eval_scope']}</td>"
-                             f"<td>{r['MAE']:.3f}</td><td>{r['RMSE']:.3f}</td>"
-                             f"<td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
-                return f"""
-<div class="avg-table-wrap">
-  <h3>{label}</h3>
-  <table>
-    <thead><tr><th>{group_col}</th><th>Scope</th><th>Avg MAE</th><th>Avg RMSE</th><th>Avg R²</th><th>Avg MAPE</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-</div>"""
-            else:
-                grp = df.groupby(group_col)[['MAE', 'RMSE', 'R2', 'MAPE']].mean().reset_index()
-                grp = grp.sort_values('MAE')
-                rows = ""
-                for _, r in grp.iterrows():
-                    rows += (f"<tr><td><b>{r[group_col]}</b></td>"
-                             f"<td>{r['MAE']:.3f}</td><td>{r['RMSE']:.3f}</td>"
-                             f"<td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
-                return f"""
-<div class="avg-table-wrap">
-  <h3>{label}</h3>
-  <table>
-    <thead><tr><th>{group_col}</th><th>Avg MAE</th><th>Avg RMSE</th><th>Avg R²</th><th>Avg MAPE</th></tr></thead>
-    <tbody>{rows}</tbody>
-  </table>
-</div>"""
+                cols_to_group.append("eval_scope")
+                
+            grp = df.groupby(cols_to_group)[['MAE', 'RMSE', 'R2', 'MAPE']].mean().reset_index()
+            # Sort để dữ liệu nhóm liền kề nhau dễ nhìn
+            grp = grp.sort_values(cols_to_group)
+            
+            header_map = {
+                "flow": "Luồng", 
+                "eval_scope": "Scope", 
+                "cluster_selection": "Chọn Cụm", 
+                "feature_option": "Features", 
+                "regression_model": "Model"
+            }
+            
+            th_html = "".join([f"<th>{header_map.get(col, col)}</th>" for col in cols_to_group])
+            
+            grp = grp.reset_index(drop=True)
+
+            rows = ""
+            x_labels = []
+            y_maes = []
+            hover_texts = []
+
+            for row_idx, r in grp.iterrows():
+                row_num = row_idx + 1
+                td_html = "".join([
+                    f"<td><b>{r[col]}</b></td>" if col == group_col else f"<td>{r[col]}</td>"
+                    for col in cols_to_group
+                ])
+                rows += (f"<tr><td style='color:#64748b;font-weight:600;'>#{row_num}</td>{td_html}"
+                         f"<td>{r['MAE']:.3f}</td><td>{r['RMSE']:.3f}</td>"
+                         f"<td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
+                x_labels.append(f"#{row_num}")
+                y_maes.append(r["MAE"])
+                detail = " | ".join([f"{header_map.get(col, col)}: {r[col]}" for col in cols_to_group])
+                hover_texts.append(f"#{row_num} {detail}<br>MAE: {r['MAE']:.3f}h")
+
+            table_html = (
+                '<div class="avg-table-wrap">'
+                f'<h3>{label}</h3>'
+                '<table>'
+                f'<thead><tr><th>#</th>{th_html}<th>Avg MAE</th><th>Avg RMSE</th><th>Avg R²</th><th>Avg MAPE</th></tr></thead>'
+                f'<tbody>{rows}</tbody>'
+                '</table></div>'
+            )
+
+            # ── Vẽ histogram phân phối MAE theo từng index ──
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            import math
+            
+            n_groups = len(grp)
+            COLS_PER_ROW = 4
+            n_rows_plot = math.ceil(n_groups / COLS_PER_ROW)
+            n_cols_plot = min(n_groups, COLS_PER_ROW)
+            
+            subplot_titles = [f"#{i+1}" for i in range(n_groups)]
+            fig = make_subplots(
+                rows=n_rows_plot, cols=n_cols_plot,
+                subplot_titles=subplot_titles,
+                horizontal_spacing=0.06,
+                vertical_spacing=0.15,
+            )
+            
+            import numpy as np
+            
+            for row_idx, (_, r) in enumerate(grp.iterrows()):
+                # Lọc raw data khớp với điều kiện của dòng này
+                mask = pd.Series([True] * len(df), index=df.index)
+                for c in cols_to_group:
+                    if c in df.columns:
+                        mask = mask & (df[c] == r[c])
+                raw_mae_vals = df.loc[mask, 'MAE'].dropna()
+                raw_mae_vals = raw_mae_vals[raw_mae_vals.abs() < 1000]  # loại outlier
+                raw_mae_list = raw_mae_vals.tolist()  # buộc dùng list để tránh binary encoding khi serialize JSON
+                
+                plot_row = row_idx // COLS_PER_ROW + 1
+                plot_col = row_idx % COLS_PER_ROW + 1
+                color = "#3B82F6"
+                
+                detail_label = " | ".join([f"{r[c]}" for c in cols_to_group])
+                
+                fig.add_trace(go.Histogram(
+                    x=raw_mae_list,
+                    nbinsx=15,
+                    name=f"#{row_idx+1}",
+                    marker_color=color,
+                    opacity=0.85,
+                    showlegend=False,
+                    hovertemplate=f"#{row_idx+1} {detail_label}<br>MAE: %{{x:.2f}}h<br>Count: %{{y}}<extra></extra>",
+                ), row=plot_row, col=plot_col)
+                if len(raw_mae_list) > 0:
+                    mean_val = float(raw_mae_vals.mean())
+                    fig.add_vline(
+                        x=mean_val,
+                        line_width=2,
+                        line_dash="dash",
+                        line_color="#EF4444",
+                        row=plot_row,
+                        col=plot_col,
+                    )
+                    # Annotation hiển thị giá trị mean phía trên đường
+                    fig.add_annotation(
+                        x=mean_val,
+                        y=1.0,
+                        xref=f"x{ (plot_row - 1) * COLS_PER_ROW + plot_col if (plot_row, plot_col) != (1, 1) else '' }",
+                        yref=f"y{ (plot_row - 1) * COLS_PER_ROW + plot_col if (plot_row, plot_col) != (1, 1) else '' } domain",
+                        text=f"Mean: {mean_val:.2f}h",
+                        showarrow=False,
+                        yshift=10,
+                        font=dict(size=10, color="#EF4444"),
+                        row=plot_row,
+                        col=plot_col,
+                    )
+            chart_height = 320 * n_rows_plot
+            fig.update_layout(
+                height=chart_height,
+                bargap=0.1,
+                margin=dict(t=40, b=30, l=45, r=15),
+                plot_bgcolor="#FAFAFA",
+                paper_bgcolor="#FFFFFF",
+            )
+            fig.update_xaxes(title_text="MAE (h)")
+            # fig.update_yaxes(title_text="Count")
+            
+            chart_id = f"avg_chart_{idx}"
+            var_name = f"fd{idx}"
+            fig_json = fig.to_json()
+            script_tag = (
+                f'<div class="avg-chart-wrap" id="{chart_id}"></div>\n'
+                f'<script>var {var_name}='
+                + fig_json
+                + f';Plotly.newPlot("{chart_id}",{var_name}.data,{var_name}.layout,{{responsive:true}});</script>\n'
+            )
+            return f'<div class="avg-row-container">{table_html}' + script_tag + '</div>'
+
+
 
         avg_html = ""
-        for col, lbl in [
+        for i, (col, lbl) in enumerate([
             ("flow",               "Theo Luồng"),
             ("cluster_selection",  "Theo Chiến lược chọn cụm"),
             ("feature_option",     "Theo Feature Option"),
             ("regression_model",   "Theo Regression Model"),
             ("eval_scope",         "Theo Eval Scope"),
-        ]:
+        ]):
             if col in df_valid.columns:
-                avg_html += _avg_table(df_valid, col, lbl)
+                avg_html += _avg_table(df_valid, col, lbl, i)
 
         html += f"""
 <div class="avg-card">
@@ -712,6 +824,46 @@ def build_html_report(results_by_flow, summary_df):
     <span style="font-size:11px;font-weight:400;color:#64748b;"> (loại bỏ outlier MAE &gt; 1000h)</span>
   </h2>
   <div class="avg-grid">{avg_html}</div>
+</div>
+"""
+
+        # ── Bảng tổng hợp tổ hợp chiến lược ──
+        combo_cols = ['flow', 'cluster_selection', 'feature_option', 'regression_model', 'eval_scope']
+        combo_grp = df_valid.groupby(combo_cols)[['MAE', 'RMSE', 'R2', 'MAPE']].mean().reset_index()
+        combo_grp = combo_grp.sort_values(combo_cols)
+        
+        combo_rows = ""
+        for _, r in combo_grp.iterrows():
+            combo_rows += (f"<tr><td>{r['flow']}</td><td>{r['cluster_selection']}</td>"
+                           f"<td>{r['feature_option']}</td><td>{r['regression_model']}</td>"
+                           f"<td>{r['eval_scope']}</td><td><b>{r['MAE']:.3f}</b></td>"
+                           f"<td>{r['RMSE']:.3f}</td><td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
+
+        table_html = f"""
+  <table id="comboSummaryTable">
+    <thead><tr>
+      <th class="sortable" onclick="sortTable(0, 'comboSummaryTable')">Luồng ↕</th>
+      <th class="sortable" onclick="sortTable(1, 'comboSummaryTable')">Chọn Cụm ↕</th>
+      <th class="sortable" onclick="sortTable(2, 'comboSummaryTable')">Features ↕</th>
+      <th class="sortable" onclick="sortTable(3, 'comboSummaryTable')">Regression ↕</th>
+      <th class="sortable" onclick="sortTable(4, 'comboSummaryTable')">Eval Scope ↕</th>
+      <th class="sortable" onclick="sortTable(5, 'comboSummaryTable')">Avg MAE (h) ↕</th>
+      <th class="sortable" onclick="sortTable(6, 'comboSummaryTable')">Avg RMSE (h) ↕</th>
+      <th class="sortable" onclick="sortTable(7, 'comboSummaryTable')">Avg R² ↕</th>
+      <th class="sortable" onclick="sortTable(8, 'comboSummaryTable')">Avg MAPE ↕</th>
+    </tr></thead>
+    <tbody>{combo_rows}</tbody>
+  </table>
+"""
+
+        html += f"""
+<div class="summary-card">
+  <h2>Trung bình toàn tổ hợp (Flow → Cụm → Feature → Model → Scope)</h2>
+  <div class="avg-row-container">
+    <div class="avg-table-wrap" style="width: 100%;">
+      {table_html}
+    </div>
+  </div>
 </div>
 """
 
@@ -893,8 +1045,10 @@ Plotly.newPlot('{id_chart}', d_{chart_idx}.data, d_{chart_idx}.layout, {{respons
     # Sort table script
     html += """
 <script>
-function sortTable(n) {
-  var table = document.getElementById("summaryTable");
+function sortTable(n, tableId) {
+  if (!tableId) tableId = "summaryTable";
+  var table = document.getElementById(tableId);
+  if (!table) return;
   var tbody = table.querySelector("tbody");
   var rows = Array.from(tbody.querySelectorAll("tr"));
 
@@ -972,7 +1126,7 @@ if __name__ == "__main__":
     print("\n" + "█" * 70)
     print("  LUỒNG 1: KHO GỬI → KHO 1A NGUỒN")
     print("█" * 70)
-    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "tong_kg", "actual_weight", False)
+    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "bill_count", "actual_weight", False)
     res_o, rep_o = run_multi_pipeline(df_o_proc, pairs_o, "time_o", "time_o1a",
                                        "Kho gửi → Kho 1A", is_dest_flow=False)
     all_results.extend(res_o)
@@ -982,7 +1136,7 @@ if __name__ == "__main__":
     print("\n" + "█" * 70)
     print("  LUỒNG 2: KHO 1A ĐÍCH → KHO NHẬN")
     print("█" * 70)
-    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "tong_kg", "actual_weight", True)
+    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "bill_count", "actual_weight", True)
     res_d, rep_d = run_multi_pipeline(df_d_proc, pairs_d, "time_d1a", "time_d",
                                        "Kho 1A → Kho nhận", is_dest_flow=True)
     all_results.extend(res_d)
