@@ -76,7 +76,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
 # ── Cấu hình ────────────────────────────────────────────────────────────
-N_TOP = 6
+N_TOP = 10
 DBSCAN_EPS = 0.5
 DBSCAN_MIN_SAMPLES = 150
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_plot")
@@ -182,8 +182,8 @@ def compute_regression_metrics(y_true, y_pred):
 
 
 def _pair_slug(pair: str) -> str:
-    """Chuyển tên cặp kho thành tên thư mục hợp lệ"""
-    return re.sub(r'[^\w]+', '_', pair).strip('_')[:80]
+    """Chuyển tên cặp kho thành tên thư mục hợp lệ (chỉ giữ ASCII để tránh lỗi trên Windows)"""
+    return re.sub(r'[^\w]+', '_', pair, flags=re.ASCII).strip('_')[:80]
 
 
 def save_models(pair, regression_models, clf, flow_name):
@@ -400,26 +400,59 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         clf_f1 = f1_score(c_test, clf_pred_test, average='weighted', zero_division=0)
         print(f"  Classifier Acc={clf_acc:.4f}, W-F1={clf_f1:.4f}")
 
-        # --- 3. Bảng lookup khung giờ → cụm lớn nhất (Cách 1) ---
-        train_dep_hours = X1_train['departure_hour_numeric'].values
-        slot_cluster_map = {}
-        for slot_name, (lo, hi) in TIME_SLOTS.items():
-            slot_mask = (train_dep_hours >= lo) & (train_dep_hours < hi)
-            if slot_mask.sum() > 0:
-                slot_clusters = c_train[slot_mask]
-                slot_cluster_map[slot_name] = pd.Series(slot_clusters).value_counts().idxmax()
-            else:
-                slot_cluster_map[slot_name] = dominant_cluster
+        # --- 3. Xây dựng thông tin cụm từ training data (Cách 1) ---
+        # Logic: scatter plot X=departure_hour, Y=y_offset, màu=cluster
+        # Với bill mới có departure_hour=h, dóng thẳng lên trục X:
+        #   → tìm cụm lớn nhất mà khoảng departure_hour của cụm đó chứa h
+        #   → nếu không cụm nào chứa → lấy cụm có mean departure_hour gần h nhất
+        train_dep_hours_arr = X1_train['departure_hour_numeric'].values
+        cluster_info = {}  # cluster_id -> {'min': ..., 'max': ..., 'mean': ..., 'count': ...}
+        for clus_id in np.unique(c_train):
+            dep_h_c = train_dep_hours_arr[c_train == clus_id]  # departure_hour của cụm này
+            cluster_info[clus_id] = {
+                'min': dep_h_c.min(),
+                'max': dep_h_c.max(),
+                'mean': dep_h_c.mean(),
+                'count': len(dep_h_c),
+            }
 
-        print(f"  Khung giờ → Cụm dominant: {slot_cluster_map}")
+        # Sắp xếp cụm theo số lượng giảm dần (ưu tiên cụm lớn khi nhiều cụm cùng chứa)
+        clusters_by_size = sorted(cluster_info.keys(),
+                                  key=lambda c: cluster_info[c]['count'], reverse=True)
+
+        def pick_cluster_by_hour(dep_hour):
+            """Dóng thẳng dep_hour lên trục X của scatter (X=departure_hour, Y=y_offset):
+            Trả về cụm lớn nhất có khoảng departure_hour chứa dep_hour.
+            Nếu không có cụm nào chứa, lấy cụm có mean departure_hour gần dep_hour nhất."""
+            for c in clusters_by_size:  # duyệt từ cụm lớn nhất
+                info = cluster_info[c]
+                if info['min'] <= dep_hour <= info['max']:
+                    return c
+            # Không có cụm nào chứa → lấy cụm gần nhất theo mean departure_hour
+            return min(clusters_by_size,
+                       key=lambda c: abs(cluster_info[c]['mean'] - dep_hour))
+
+        info_str = " | ".join([
+            f"Cụm {c}: dep_hour=[{cluster_info[c]['min']:.1f}h, {cluster_info[c]['max']:.1f}h] "
+            f"mean={cluster_info[c]['mean']:.1f}h n={cluster_info[c]['count']}"
+            for c in sorted(cluster_info.keys())
+        ])
+        print(f"  Thông tin cụm theo departure_hour (Cách 1): {info_str}")
+
+        # slot_cluster_map vẫn giữ để dùng trong HTML report (dạng rút gọn)
+        slot_cluster_map = {
+            f"Cụm {c}": f"dep=[{cluster_info[c]['min']:.1f}h–{cluster_info[c]['max']:.1f}h] mean={cluster_info[c]['mean']:.1f}h"
+            for c in sorted(cluster_info.keys())
+        }
 
         # ══ INFERENCE ══
         print(f"\n  Inference trên {len(idx_test):,} bills test...")
 
         # Bước 1: Chọn cụm cho mỗi bill test
-        # Cách 1 (Dominant Cluster): Với mỗi khung giờ, lấy cụm chiếm đa số trong training
+        # Cách 1 (Dominant Cluster): Lấy cụm lớn nhất chứa departure_hour;
+        #   nếu không có thì lấy cụm gần nhất theo mean
         chosen_c1 = np.array([
-            slot_cluster_map.get(get_time_slot(h), dominant_cluster)
+            pick_cluster_by_hour(h)
             for h in dep_hour_test
         ])
 
@@ -497,18 +530,22 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
                     if valid.sum() == 0:
                         continue
 
-                    # Eval Cách 1: Toàn bộ test
+                    # Eval scope 1: Toàn bộ test
                     metrics_all = compute_regression_metrics(y_test[valid], y_pred[valid])
 
-                    # Eval Cách 2: Chỉ bill thuộc cụm lớn nhất
-                    dom_mask = valid & (c_test == dominant_cluster)
+                    # Eval scope 2: Bill thuộc cụm dominant VÀ chiến lược gán đúng vào dominant
+                    # → loại lỗi cluster selection, chỉ đo chất lượng regression model
+                    dom_mask = valid & (c_test == dominant_cluster) & (chosen_clusters == dominant_cluster)
                     metrics_dom = compute_regression_metrics(y_test[dom_mask], y_pred[dom_mask]) if dom_mask.sum() > 0 else {
                         "MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "MAPE": np.nan
                     }
 
                     combo_label = f"{cs_name} | {fo_name} | {reg_name}"
 
-                    for eval_scope, metrics in [("All", metrics_all), ("Dominant", metrics_dom)]:
+                    for eval_scope, metrics, n_s in [
+                        ("All",               metrics_all, int(valid.sum())),
+                        ("Dominant (Correct)", metrics_dom, int(dom_mask.sum())),
+                    ]:
                         result = {
                             "flow": flow_name,
                             "pair": pair,
@@ -516,7 +553,7 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
                             "feature_option": fo_name,
                             "regression_model": reg_name,
                             "eval_scope": eval_scope,
-                            "n_samples_test": int(valid.sum()) if eval_scope == "All" else int(dom_mask.sum()),
+                            "n_samples_test": n_s,
                             **metrics
                         }
                         all_results.append(result)
@@ -528,6 +565,7 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
                         "reg_name": reg_name,
                         "metrics_all": metrics_all,
                         "metrics_dom": metrics_dom,
+                        "n_dom": int(dom_mask.sum()),
                     })
 
         # Thống kê cluster
@@ -933,14 +971,17 @@ def build_html_report(results_by_flow, summary_df):
             for combo in combos:
                 m_all = combo['metrics_all']
                 m_dom = combo['metrics_dom']
+                n_dom = combo['n_dom']
+                def _f(v, fmt=".2f"): return format(v, fmt) if not (isinstance(v, float) and (v != v)) else "N/A"
                 combo_rows += f"""<tr>
                     <td>{combo['cs_name']}</td>
                     <td>{combo['fo_name']}</td>
                     <td>{combo['reg_name']}</td>
-                    <td><b>{m_all['MAE']:.2f}</b></td><td>{m_all['RMSE']:.2f}</td>
-                    <td>{m_all['R2']:.4f}</td><td>{m_all['MAPE']:.1f}%</td>
-                    <td><b>{m_dom['MAE']:.2f}</b></td><td>{m_dom['RMSE']:.2f}</td>
-                    <td>{m_dom['R2']:.4f}</td><td>{m_dom['MAPE']:.1f}%</td>
+                    <td><b>{_f(m_all['MAE'])}</b></td><td>{_f(m_all['RMSE'])}</td>
+                    <td>{_f(m_all['R2'], '.4f')}</td><td>{_f(m_all['MAPE'], '.1f')}%</td>
+                    <td><b>{_f(m_dom['MAE'])}</b></td><td>{_f(m_dom['RMSE'])}</td>
+                    <td>{_f(m_dom['R2'], '.4f')}</td><td>{_f(m_dom['MAPE'], '.1f')}%</td>
+                    <td style='color:#64748b;font-size:11px'>{n_dom:,}</td>
                 </tr>"""
 
             # ── Bar Chart: MAE comparison ──
@@ -949,7 +990,7 @@ def build_html_report(results_by_flow, summary_df):
 
             fig = make_subplots(
                 rows=1, cols=2,
-                subplot_titles=["MAE - Toàn bộ test (All)", "MAE - Cụm lớn nhất (Dominant)"],
+                subplot_titles=["MAE - Toàn bộ test (All)", "MAE - Dominant (Correct)"],
                 horizontal_spacing=0.12
             )
 
@@ -989,8 +1030,8 @@ def build_html_report(results_by_flow, summary_df):
             id_chart = f"chart_{chart_idx}"
             # KHÔNG tăng chart_idx ở đây — phải dùng cùng giá trị trong script bên dưới
 
-            # Slot map info
-            slot_info = " | ".join([f"{k}: Cụm {v}" for k, v in rep['slot_cluster_map'].items()])
+            # Slot map info (Cách 1: khoảng departure_hour của mỗi cụm)
+            slot_info = " | ".join([f"{k}: {v}" for k, v in rep['slot_cluster_map'].items()])
 
             fig_json = fig.to_json()
             html += f"""
@@ -1024,12 +1065,14 @@ def build_html_report(results_by_flow, summary_df):
       <thead><tr>
         <th>Chọn Cụm</th><th>Features</th><th>Regression</th>
         <th colspan="4" style="text-align:center;background:#dbeafe">── All ──</th>
-        <th colspan="4" style="text-align:center;background:#dcfce7">── Dominant ──</th>
+        <th colspan="4" style="text-align:center;background:#dcfce7">── Dominant (Correct) ──</th>
+        <th style="text-align:center;background:#dcfce7">N</th>
       </tr>
       <tr>
         <th></th><th></th><th></th>
         <th>MAE</th><th>RMSE</th><th>R²</th><th>MAPE</th>
         <th>MAE</th><th>RMSE</th><th>R²</th><th>MAPE</th>
+        <th></th>
       </tr></thead>
       <tbody>{combo_rows}</tbody>
     </table>
@@ -1126,7 +1169,7 @@ if __name__ == "__main__":
     print("\n" + "█" * 70)
     print("  LUỒNG 1: KHO GỬI → KHO 1A NGUỒN")
     print("█" * 70)
-    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "bill_count", "actual_weight", False)
+    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "tong_kg", "actual_weight", False)
     res_o, rep_o = run_multi_pipeline(df_o_proc, pairs_o, "time_o", "time_o1a",
                                        "Kho gửi → Kho 1A", is_dest_flow=False)
     all_results.extend(res_o)
@@ -1136,7 +1179,7 @@ if __name__ == "__main__":
     print("\n" + "█" * 70)
     print("  LUỒNG 2: KHO 1A ĐÍCH → KHO NHẬN")
     print("█" * 70)
-    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "bill_count", "actual_weight", True)
+    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "tong_kg", "actual_weight", True)
     res_d, rep_d = run_multi_pipeline(df_d_proc, pairs_d, "time_d1a", "time_d",
                                        "Kho 1A → Kho nhận", is_dest_flow=True)
     all_results.extend(res_d)
