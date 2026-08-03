@@ -73,7 +73,7 @@ if hasattr(sys.stdout, "reconfigure"):
 import pandas as pd
 import numpy as np
 import joblib
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 from sklearn.linear_model import LinearRegression
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
 from lightgbm import LGBMRegressor
@@ -86,15 +86,71 @@ from plotly.subplots import make_subplots
 # ── Cấu hình ────────────────────────────────────────────────────────────
 N_TOP = 10
 DBSCAN_EPS = 0.5
-DBSCAN_MIN_SAMPLES = 150
+DBSCAN_MIN_SAMPLES = 150        # trần tối đa (áp dụng cho cặp kho lưu lượng lớn)
+DBSCAN_MIN_SAMPLES_FLOOR = 10   # sàn tối thiểu (áp dụng cho cặp kho lưu lượng nhỏ)
+DBSCAN_MIN_SAMPLES_FRAC = 0.03  # % cỡ mẫu trainval dùng để nội suy min_samples giữa sàn và trần
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_plot")
 MODELS_DIR = os.path.join(OUTPUT_DIR, "saved_models")  
 HYBRID_THRESHOLD = 0.6  
+N_SELECTION_FOLDS = 3   # số fold dùng cho K-Fold CV khi chọn best_combo (giảm winner's curse so với 1 val split)
+
+# Đánh version thủ công mỗi khi đổi feature engineering (_build_X2) hoặc hyperparams model (_model_specs),
+# để CONFIG_HASH tự động vô hiệu cache cũ khi logic thay đổi, ngay cả khi DBSCAN/HYBRID_THRESHOLD không đổi.
+FEATURE_VERSION   = "v5_cluster_iqr"
+MODEL_PARAMS_SIG  = "rf_lgbm_leaf_pct_v3_fixed"
 
 # Cache key: thay đổi bất kỳ tham số nào dưới đây sẽ tự động vô hiệu hóa model cache cũ
 CONFIG_HASH = hashlib.md5(
-    f"{DBSCAN_EPS}_{DBSCAN_MIN_SAMPLES}_{HYBRID_THRESHOLD}".encode()
+    f"{DBSCAN_EPS}_{DBSCAN_MIN_SAMPLES}_{DBSCAN_MIN_SAMPLES_FLOOR}_{DBSCAN_MIN_SAMPLES_FRAC}_"
+    f"{HYBRID_THRESHOLD}_{N_SELECTION_FOLDS}_{FEATURE_VERSION}_{MODEL_PARAMS_SIG}".encode()
 ).hexdigest()[:8]
+
+
+def _model_specs(n_samples: int):
+    """Trả về danh sách (tên, constructor) cho regression models, với độ phức tạp
+    co giãn theo cỡ mẫu của cụm đang fit, để giảm overfitting khi một cụm chỉ có
+    vài trăm mẫu.
+    """
+    n = max(int(n_samples), 1)
+
+    # 1. Depth co giãn theo log2(n) để tránh cây quá sâu cho tập dữ liệu nhỏ
+    depth = max(5, min(12, int(np.log2(n))))
+    
+    # 2. Số lượng node lá cho LGBM
+    leaves = max(16, min(256, int(n / 20))) 
+    
+    # 3. min_samples_leaf: 1% của data, giới hạn trong khoảng [5, 30] 
+    leaf = max(5, min(30, int(n * 0.01)))
+    
+    lr = 0.05 if n < 500 else 0.08
+    n_est = 150 if n < 2000 else 200
+
+    return [
+        ("LR", lambda: LinearRegression()),
+        ("RF", lambda: RandomForestRegressor(
+            n_estimators=n_est, max_depth=depth, min_samples_leaf=leaf,
+            max_features=0.6, n_jobs=-1, random_state=42)),
+        ("LGBM", lambda: LGBMRegressor(
+            n_estimators=n_est, max_depth=depth, num_leaves=leaves,
+            min_child_samples=leaf, learning_rate=lr,
+            subsample=0.8, subsample_freq=1, colsample_bytree=0.8,
+            verbose=-1, random_state=42, n_jobs=-1)),
+    ]
+
+
+def _classifier_specs(n_samples: int):
+    """Trả về mô hình RandomForestClassifier có độ phức tạp co giãn theo cỡ mẫu."""
+    n = max(int(n_samples), 1)
+
+    depth = max(5, min(12, int(np.log2(n))))
+    leaf = max(5, min(30, int(n * 0.01)))
+    n_est = 150 if n < 2000 else 200
+
+    return RandomForestClassifier(
+        n_estimators=n_est, max_depth=depth, min_samples_leaf=leaf,
+        class_weight="balanced", n_jobs=-1, random_state=42, bootstrap=True,oob_score=True
+    )
+
 
 EXCLUDE = [
     'Kho TGDĐ Bảo Hành', 'Kho Hà Tĩnh', 'Kho Kiến An', 'Kho Thường Tín',
@@ -102,14 +158,6 @@ EXCLUDE = [
     'Kho Ninh Hòa', 'Kho An Giang',
     'Bưu cục Dự Án Vgreen Sóng Thần', 'Bưu cục Dự Án Vgreen Văn Giang'
 ]
-
-TIME_SLOTS = {
-    "Sáng sớm (0-6h)": (0, 6),
-    "Sáng (6-12h)": (6, 12),
-    "Chiều (12-18h)": (12, 18),
-    "Tối (18-24h)": (18, 24),
-}
-
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 def get_top_pairs(df, col_a, col_b, sort_by, wt_col, is_dest_flow):
@@ -168,15 +216,6 @@ def transform_province(series, top=10):
     s = series.copy()
     top_province = s.value_counts().nlargest(top).index.tolist()
     return s.where(s.isin(top_province), 'khác')
-
-
-def get_time_slot(hour):
-    """Trả về khung giờ cho 1 giá trị giờ"""
-    for slot_name, (lo, hi) in TIME_SLOTS.items():
-        if lo <= hour < hi:
-            return slot_name
-    return "Tối (18-24h)"
-
 
 def compute_regression_metrics(y_true, y_pred):
     """Tính MAE, RMSE, R², MAPE"""
@@ -240,6 +279,8 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
     """
     all_results = []       # Tổng hợp metrics cho CSV
     flow_pair_reports = [] # Chi tiết cho HTML
+    skip_reasons = {}       # Đếm số cặp bị bỏ qua theo từng lý do, để tổng kết cuối hàm
+    n_candidates = len(pairs)
 
     for pair in pairs:
         print(f"\n{'='*70}")
@@ -258,7 +299,8 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
                 sub = sub[((sub['time'] >= q1) & (sub['time'] <= q3))]
 
         if sub.empty or len(sub) < 200:
-            print('  Kh\u00f4ng \u0111\u1ee7 d\u1eef li\u1ec7u --> B\u1ecf qua')
+            print('  Không đủ dữ liệu --> Bỏ qua')
+            skip_reasons[pair] = f"Không đủ dữ liệu (n={len(sub)})"
             continue
 
         # T\u00ednh y_offset v\u00e0 departure_hour
@@ -272,7 +314,8 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         sub = sub[((sub['y_offset'] > 0) & (sub['y_offset'] < 48))].copy()
 
         if sub.empty or len(sub) < 200:
-            print('  Kh\u00f4ng \u0111\u1ee7 d\u1eef li\u1ec7u sau l\u1ecdc --> B\u1ecf qua')
+            print('  Không đủ dữ liệu sau lọc --> Bỏ qua')
+            skip_reasons[pair] = f"Không đủ dữ liệu sau lọc y_offset (n={len(sub)})"
             continue
 
         if len(sub) > 20000:
@@ -286,8 +329,18 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         sub_test     = sub.iloc[idx_test_raw].copy().reset_index(drop=True)
 
         # ══ Bước B: DBSCAN chỉ trên trainval ══
+        # min_samples co giãn theo cỡ mẫu trainval của TỪNG cặp kho: cặp lưu lượng thấp
+        # dùng min_samples nhỏ hơn (sàn DBSCAN_MIN_SAMPLES_FLOOR), cặp lớn dùng tối đa
+        # DBSCAN_MIN_SAMPLES. Tránh việc 1 con số tuyệt đối cố định loại oan gần hết các
+        # cặp kho lưu lượng thấp/trung bình (min_samples=150 cố định có thể chiếm tới
+        # 25-75% trainval của 1 cặp nhỏ, khiến gần như mọi điểm bị gắn nhãn noise).
+        eff_min_samples = int(min(
+            DBSCAN_MIN_SAMPLES,
+            max(DBSCAN_MIN_SAMPLES_FLOOR, len(sub_trainval) * DBSCAN_MIN_SAMPLES_FRAC)
+        ))
+        print(f"  DBSCAN min_samples hiệu dụng: {eff_min_samples} (trainval={len(sub_trainval):,} bills)")
         y_tv_raw = sub_trainval['y_offset'].values.reshape(-1, 1)
-        dbscan   = DBSCAN(eps=DBSCAN_EPS, min_samples=DBSCAN_MIN_SAMPLES)
+        dbscan   = DBSCAN(eps=DBSCAN_EPS, min_samples=eff_min_samples)
         sub_trainval['cluster'] = dbscan.fit_predict(y_tv_raw)
 
         valid_mask_tv = sub_trainval['cluster'] != -1
@@ -297,11 +350,22 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             cluster_mapping = {old_c: new_c for new_c, old_c in enumerate(sorted_clusters)}
             cluster_mapping[-1] = -1
             sub_trainval['cluster'] = sub_trainval['cluster'].map(cluster_mapping)
+            
+            # Gán điểm nhiễu (noise) vào cụm có mean gần nhất để không làm mất data
+            valid_centers = sub_trainval.loc[sub_trainval['cluster'] != -1].groupby('cluster')['y_offset'].mean()
+            if not valid_centers.empty:
+                noise_mask = sub_trainval['cluster'] == -1
+                def assign_nearest_cluster(y_val):
+                    return (valid_centers - y_val).abs().idxmin()
+                if noise_mask.any():
+                    sub_trainval.loc[noise_mask, 'cluster'] = sub_trainval.loc[noise_mask, 'y_offset'].apply(assign_nearest_cluster)
 
-        sub_tv_clean = sub_trainval[sub_trainval['cluster'] != -1].copy().reset_index(drop=True)
+        sub_tv_clean = sub_trainval.copy().reset_index(drop=True)
         n_cluster = sub_tv_clean['cluster'].nunique()
         if n_cluster < 2:
             print("  Không đủ số lượng cụm. Bỏ qua.")
+            skip_reasons[pair] = (f"Không đủ cụm sau DBSCAN (min_samples={eff_min_samples}, "
+                                   f"trainval={len(sub_trainval)}, n_cluster={n_cluster})")
             continue
         print(f"  Số mẫu trainval hợp lệ {len(sub_tv_clean):,} | Số cụm {n_cluster}")
 
@@ -310,6 +374,14 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         print(f"  Cụm lớn nhất: Cụm {dominant_cluster} ({cluster_counts[dominant_cluster]:,} bills)")
 
         # ══ Bước C: Feature Engineering ══
+        w_median = sub_tv_clean['actual_weight'].median() if 'actual_weight' in sub_tv_clean.columns else 0
+        top_origin = []
+        if 'origin_province' in sub_tv_clean.columns:
+            top_origin = sub_tv_clean['origin_province'].value_counts().nlargest(10).index.tolist()
+        top_dest = []
+        if 'destination_province' in sub_tv_clean.columns:
+            top_dest = sub_tv_clean['destination_province'].value_counts().nlargest(10).index.tolist()
+
         def _build_X2(sub_df):
             X2 = pd.DataFrame(index=sub_df.index)
             X2['departure_hour_numeric'] = sub_df['departure_hour_numeric']
@@ -317,16 +389,18 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             for c in _cats:
                 if c in sub_df.columns:
                     X2 = pd.concat([X2, pd.get_dummies(sub_df[c], prefix=c)], axis=1)
-            if is_dest_flow:
-                if "origin_province" in sub_df.columns:
-                    X2 = pd.concat([X2, pd.get_dummies(
-                        transform_province(sub_df['origin_province']), prefix='origin_prov')], axis=1)
-            else:
-                if "destination_province" in sub_df.columns:
-                    X2 = pd.concat([X2, pd.get_dummies(
-                        transform_province(sub_df['destination_province']), prefix='dest_prov')], axis=1)
+            
+            if is_dest_flow and "origin_province" in sub_df.columns:
+                s = sub_df['origin_province'].where(sub_df['origin_province'].isin(top_origin), 'khác')
+                s = pd.Categorical(s, categories=top_origin + ['khác'])
+                X2 = pd.concat([X2, pd.get_dummies(s, prefix='origin_prov')], axis=1)
+            elif not is_dest_flow and "destination_province" in sub_df.columns:
+                s = sub_df['destination_province'].where(sub_df['destination_province'].isin(top_dest), 'khác')
+                s = pd.Categorical(s, categories=top_dest + ['khác'])
+                X2 = pd.concat([X2, pd.get_dummies(s, prefix='dest_prov')], axis=1)
+                
             w = sub_df['actual_weight'] if 'actual_weight' in sub_df.columns else pd.Series(0, index=sub_df.index)
-            X2['actual_weight'] = w.fillna(w.median())
+            X2['actual_weight'] = w.fillna(w_median)
             return X2
 
         X1_tv  = sub_tv_clean[['departure_hour_numeric']].copy()
@@ -346,6 +420,7 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         X1_tv, X2_tv, y_tv, c_tv = X1_tv[_vmask], X2_tv[_vmask], y_tv[_vmask], c_tv[_vmask]
         if len(np.unique(c_tv)) < 2:
             print("  Không đủ nhãn hợp lệ. Bỏ qua.")
+            skip_reasons[pair] = f"Không đủ nhãn hợp lệ sau lọc cụm hiếm (n_labels={len(np.unique(c_tv))})"
             continue
 
         # ══ Bước D: Split trainval → train (75%) / val (25%) ══
@@ -375,130 +450,176 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             if not all_val_scores:
                 print("  [Cache hit] Cảnh báo: cache cũ không có val_scores → Val Selection Table sẽ trống cho cặp này.")
         else:
-            # Model specs
-            model_specs = [
-                ("LR",   LinearRegression),
-                ("RF",   lambda: RandomForestRegressor(n_estimators=100, max_depth=15, n_jobs=-1, random_state=42)),
-                ("LGBM", lambda: LGBMRegressor(n_estimators=100, max_depth=15, verbose=-1, random_state=42, n_jobs=-1)),
+            # ── Phase 1: Val Selection bằng K-Fold CV trên TRAINVAL (giảm winner's curse) ──
+            # Thay vì chọn best_combo dựa trên 1 lần split train/val duy nhất (dễ chọn nhầm
+            # combo "ăn may" theo nhiễu của đúng val set đó), ta dùng N_SELECTION_FOLDS-Fold CV
+            # trên toàn bộ trainval: mỗi điểm dữ liệu được dùng làm val đúng 1 lần (out-of-fold),
+            # rồi MAE/RMSE được tính gộp trên toàn bộ out-of-fold predictions của mỗi combo.
+            print(f"\n  [Phase 1/2] Val Selection bằng {N_SELECTION_FOLDS}-Fold CV trên TrainVal ({len(y_tv):,} bills)...")
+
+            try:
+                _kf = StratifiedKFold(n_splits=N_SELECTION_FOLDS, shuffle=True, random_state=42)
+                fold_iter = list(_kf.split(X2_tv, c_tv))
+            except ValueError:
+                # Một số cụm không đủ mẫu để stratify theo N_SELECTION_FOLDS → fallback KFold thường
+                _kf = KFold(n_splits=N_SELECTION_FOLDS, shuffle=True, random_state=42)
+                fold_iter = list(_kf.split(X2_tv))
+
+            # Out-of-fold predictions cho từng combo (18 combo), khởi tạo NaN
+            combo_keys = [
+                (cs_name, fo_name, reg_name)
+                for cs_name in ["Cách 1 (Dominant Cluster)", "Cách 2 (ML Classifier)", "Cách 3 (Hybrid)"]
+                for fo_name in ["Option 1 (Hour)", "Option 2 (Full)"]
+                for reg_name in ["LR", "RF", "LGBM"]
             ]
+            oof_pred = {k: np.full(len(y_tv), np.nan) for k in combo_keys}
+            oof_clf_pred = np.empty(len(c_tv), dtype=c_tv.dtype)
+            oof_clf_max  = np.full(len(c_tv), np.nan)
 
-            # ── Phase 1: Train trên TRAIN (cho val selection) ──
-            print(f"\n  [Phase 1/2] Training selection models trên Train ({len(y_train):,} bills)...")
-            sel_reg = {}
-            for clus in sorted(np.unique(c_train)):
-                mask_c = c_train == clus
-                y_c    = y_train[mask_c]
-                for opt_name, opt_X in [("Opt1", X1_train), ("Opt2", X2_train)]:
-                    X_c = opt_X.iloc[mask_c.nonzero()[0]]
-                    for mn, mf in model_specs:
-                        try:
-                            m = mf() if callable(mf) and not isinstance(mf, type) else mf()
-                            m.fit(X_c, y_c)
-                            sel_reg[(clus, mn, opt_name)] = m
-                        except Exception as e:
-                            print(f"     Lỗi fit {mn} cụm {clus} {opt_name}: {e}")
+            for fold_i, (idx_fr, idx_fv) in enumerate(fold_iter, start=1):
+                X1_fr, X1_fv = X1_tv.iloc[idx_fr], X1_tv.iloc[idx_fv]
+                X2_fr, X2_fv = X2_tv.iloc[idx_fr], X2_tv.iloc[idx_fv]
+                y_fr, y_fv   = y_tv[idx_fr], y_tv[idx_fv]
+                c_fr, c_fv   = c_tv[idx_fr], c_tv[idx_fv]
 
-            sel_clf = RandomForestClassifier(n_estimators=100, class_weight="balanced",
-                                             n_jobs=-1, max_depth=15, random_state=42)
-            sel_clf.fit(X2_train, c_train)
+                # Train regression per cluster trên fold-train (dùng _model_specs co giãn theo n)
+                sel_reg_f = {}
+                for clus in sorted(np.unique(c_fr)):
+                    mask_c = c_fr == clus
+                    y_c    = y_fr[mask_c]
+                    n_c    = int(mask_c.sum())
+                    for opt_name, opt_X in [("Opt1", X1_fr), ("Opt2", X2_fr)]:
+                        X_c = opt_X.iloc[mask_c.nonzero()[0]]
+                        for mn, mf in _model_specs(n_c):
+                            try:
+                                m = mf()
+                                m.fit(X_c, y_c)
+                                sel_reg_f[(clus, mn, opt_name)] = m
+                            except Exception as e:
+                                print(f"     [Fold {fold_i}] Lỗi fit {mn} cụm {clus} {opt_name}: {e}")
 
-            _cp_val    = sel_clf.predict_proba(X2_val)
-            _cpred_val = sel_clf.classes_[np.argmax(_cp_val, axis=1)]
-            clf_acc    = float(accuracy_score(c_val, _cpred_val))
-            clf_f1     = float(f1_score(c_val, _cpred_val, average='weighted', zero_division=0))
-            hybrid_ml_rate = float(np.mean(np.max(_cp_val, axis=1) >= HYBRID_THRESHOLD))
-            print(f"  Classifier (Val) Acc={clf_acc:.4f}, W-F1={clf_f1:.4f}")
+                sel_clf_f = _classifier_specs(len(X2_fr))
+                sel_clf_f.fit(X2_fr, c_fr)
 
-            # Cluster info từ train
-            dep_train = X1_train['departure_hour_numeric'].values
-            ci_sel = {}
-            for cid in np.unique(c_train):
-                dh = dep_train[c_train == cid]
-                ci_sel[cid] = {'min': dh.min(), 'max': dh.max(), 'mean': dh.mean(), 'count': len(dh)}
-            cbs_sel = sorted(ci_sel.keys(), key=lambda c: ci_sel[c]['count'], reverse=True)
+                _cp_fv    = sel_clf_f.predict_proba(X2_fv)
+                _cpred_fv = sel_clf_f.classes_[np.argmax(_cp_fv, axis=1)]
+                _cmax_fv  = np.max(_cp_fv, axis=1)
+                oof_clf_pred[idx_fv] = _cpred_fv
+                oof_clf_max[idx_fv]  = _cmax_fv
 
-            def _pick_sel(dep_hour):
-                for c in cbs_sel:
-                    if ci_sel[c]['min'] <= dep_hour <= ci_sel[c]['max']:
-                        return c
-                return min(cbs_sel, key=lambda c: abs(ci_sel[c]['mean'] - dep_hour))
+                # Cluster info từ fold-train (cho Cách 1 - Dominant Cluster by hour)
+                dep_fr = X1_fr['departure_hour_numeric'].values
+                ci_f = {}
+                for cid in np.unique(c_fr):
+                    dh = dep_fr[c_fr == cid]
+                    if len(dh) > 0:
+                        q1, q3 = np.percentile(dh, [25, 75])
+                        iqr = q3 - q1
+                        lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                        dh_filtered = dh[(dh >= lower) & (dh <= upper)]
+                        c_min = dh_filtered.min() if len(dh_filtered) > 0 else dh.min()
+                        c_max = dh_filtered.max() if len(dh_filtered) > 0 else dh.max()
+                    else:
+                        c_min, c_max = 0, 24
+                    ci_f[cid] = {'min': c_min, 'max': c_max, 'mean': dh.mean(), 'count': len(dh)}
+                cbs_f = sorted(ci_f.keys(), key=lambda c: ci_f[c]['count'], reverse=True)
 
-            # ── Val Selection Loop ──
-            _clf_max_v  = np.max(_cp_val, axis=1)
-            _clf_pred_v = _cpred_val
-            dep_hour_v  = X1_val['departure_hour_numeric'].values
+                def _pick_f(dep_hour, _ci=ci_f, _cbs=cbs_f):
+                    for c in _cbs:
+                        if _ci[c]['min'] <= dep_hour <= _ci[c]['max']:
+                            return c
+                    return min(_cbs, key=lambda c: abs(_ci[c]['mean'] - dep_hour))
 
-            chv1 = np.array([_pick_sel(h) for h in dep_hour_v])
-            chv2 = _clf_pred_v.copy()
-            chv3 = np.where(_clf_max_v >= HYBRID_THRESHOLD, _clf_pred_v, chv1)
+                dep_fv = X1_fv['departure_hour_numeric'].values
+                chv1 = np.array([_pick_f(h) for h in dep_fv])
+                chv2 = _cpred_fv.copy()
+                chv3 = np.where(_cmax_fv >= HYBRID_THRESHOLD, _cpred_fv, chv1)
 
-            print(f"\n  Val Selection: {3*2*3} combo trên val ({len(y_val):,} bills)...")
-            for cs_name, ch_v in [
-                ("Cách 1 (Dominant Cluster)", chv1),
-                ("Cách 2 (ML Classifier)",    chv2),
-                ("Cách 3 (Hybrid)",            chv3),
-            ]:
-                for fo_name, X_v_opt, opt_key in [
-                    ("Option 1 (Hour)", X1_val, "Opt1"),
-                    ("Option 2 (Full)", X2_val, "Opt2"),
+                for cs_name, ch_v in [
+                    ("Cách 1 (Dominant Cluster)", chv1),
+                    ("Cách 2 (ML Classifier)",    chv2),
+                    ("Cách 3 (Hybrid)",            chv3),
                 ]:
-                    for reg_name in ["LR", "RF", "LGBM"]:
-                        yp = np.full(len(y_val), np.nan)
-                        for cid in np.unique(ch_v):
-                            idx_cv = np.where(ch_v == cid)[0]
-                            key = (cid, reg_name, opt_key)
-                            if key not in sel_reg:
-                                key = (dominant_cluster, reg_name, opt_key)
-                            if key not in sel_reg:
-                                continue
-                            cm = c_train == cid
-                            lo = y_train[cm].min() - 2 if cm.any() else -2
-                            hi = y_train[cm].max() + 2 if cm.any() else 50
-                            yp[idx_cv] = np.clip(sel_reg[key].predict(X_v_opt.iloc[idx_cv]), lo, hi)
-                        vv = ~np.isnan(yp)
-                        if vv.sum() == 0:
-                            continue
-                        all_val_scores.append({
-                            "cs_name": cs_name, "fo_name": fo_name, "reg_name": reg_name,
-                            "val_mae":  float(np.mean(np.abs(y_val[vv] - yp[vv]))),
-                            "val_rmse": float(np.sqrt(np.mean((y_val[vv] - yp[vv])**2))),
-                            "n_val": int(vv.sum()),
-                        })
+                    for fo_name, X_v_opt, opt_key in [
+                        ("Option 1 (Hour)", X1_fv, "Opt1"),
+                        ("Option 2 (Full)", X2_fv, "Opt2"),
+                    ]:
+                        for reg_name in ["LR", "RF", "LGBM"]:
+                            yp = np.full(len(y_fv), np.nan)
+                            for cid in np.unique(ch_v):
+                                idx_cv = np.where(ch_v == cid)[0]
+                                key = (cid, reg_name, opt_key)
+                                if key not in sel_reg_f:
+                                    key = (dominant_cluster, reg_name, opt_key)
+                                if key not in sel_reg_f:
+                                    continue
+                                lo = y_fr.min() - 2 if len(y_fr) > 0 else -2
+                                hi = y_fr.max() + 2 if len(y_fr) > 0 else 50
+                                yp[idx_cv] = np.clip(sel_reg_f[key].predict(X_v_opt.iloc[idx_cv]), lo, hi)
+                            oof_pred[(cs_name, fo_name, reg_name)][idx_fv] = yp
+
+            # Gộp out-of-fold classifier predictions cho báo cáo diagnostic
+            clf_acc    = float(accuracy_score(c_tv, oof_clf_pred))
+            clf_f1     = float(f1_score(c_tv, oof_clf_pred, average='weighted', zero_division=0))
+            hybrid_ml_rate = float(np.mean(oof_clf_max >= HYBRID_THRESHOLD))
+            print(f"  Classifier ({N_SELECTION_FOLDS}-Fold CV, out-of-fold) Acc={clf_acc:.4f}, W-F1={clf_f1:.4f}")
+
+            # Tính MAE/RMSE gộp trên toàn bộ out-of-fold predictions của mỗi combo
+            print(f"\n  Val Selection: {len(combo_keys)} combo, đánh giá bằng {N_SELECTION_FOLDS}-Fold CV out-of-fold...")
+            for (cs_name, fo_name, reg_name), yp in oof_pred.items():
+                vv = ~np.isnan(yp)
+                if vv.sum() == 0:
+                    continue
+                all_val_scores.append({
+                    "cs_name": cs_name, "fo_name": fo_name, "reg_name": reg_name,
+                    "val_mae":  float(np.mean(np.abs(y_tv[vv] - yp[vv]))),
+                    "val_rmse": float(np.sqrt(np.mean((y_tv[vv] - yp[vv]) ** 2))),
+                    "n_val": int(vv.sum()),
+                })
 
             all_val_scores.sort(key=lambda x: x['val_mae'])
             best_combo = all_val_scores[0] if all_val_scores else {
                 "cs_name": "Cách 3 (Hybrid)", "fo_name": "Option 2 (Full)", "reg_name": "LGBM",
                 "val_mae": np.nan, "val_rmse": np.nan, "n_val": 0,
             }
-            print(f"  → Best (Val MAE={best_combo['val_mae']:.3f}h): "
+            print(f"  → Best (CV Val MAE={best_combo['val_mae']:.3f}h qua {N_SELECTION_FOLDS} folds): "
                   f"{best_combo['cs_name']} | {best_combo['fo_name']} | {best_combo['reg_name']}")
 
-            # ── Phase 2: Retrain trên TRAINVAL (80%) ──
+            # ── Phase 2: Retrain trên TRAINVAL (80%) với _model_specs co giãn theo cỡ mẫu ──
             print(f"\n  [Phase 2/2] Retrain final models trên TrainVal ({len(y_tv):,} bills)...")
             final_reg_models = {}
             for clus in sorted(np.unique(c_tv)):
                 mask_tv = c_tv == clus
                 y_c = y_tv[mask_tv]
+                n_c = int(mask_tv.sum())
                 for opt_name, opt_X in [("Opt1", X1_tv), ("Opt2", X2_tv)]:
                     X_c = opt_X.iloc[mask_tv.nonzero()[0]]
-                    for mn, mf in model_specs:
+                    for mn, mf in _model_specs(n_c):
                         try:
-                            m = mf() if callable(mf) and not isinstance(mf, type) else mf()
+                            m = mf()
                             m.fit(X_c, y_c)
                             final_reg_models[(clus, mn, opt_name)] = m
                         except Exception as e:
                             print(f"     Lỗi retrain {mn} cụm {clus} {opt_name}: {e}")
             print(f"  Đã retrain {len(final_reg_models)} final regression models")
 
-            final_clf = RandomForestClassifier(n_estimators=100, class_weight="balanced",
-                                               n_jobs=-1, max_depth=15, random_state=42)
+            final_clf = _classifier_specs(len(X2_tv))
             final_clf.fit(X2_tv, c_tv)
 
             dep_tv = X1_tv['departure_hour_numeric'].values
             cluster_info_final = {}
             for cid in np.unique(c_tv):
                 dh = dep_tv[c_tv == cid]
-                cluster_info_final[cid] = {'min': dh.min(), 'max': dh.max(), 'mean': dh.mean(), 'count': len(dh)}
+                if len(dh) > 0:
+                    q1, q3 = np.percentile(dh, [25, 75])
+                    iqr = q3 - q1
+                    lower, upper = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+                    dh_filtered = dh[(dh >= lower) & (dh <= upper)]
+                    c_min = dh_filtered.min() if len(dh_filtered) > 0 else dh.min()
+                    c_max = dh_filtered.max() if len(dh_filtered) > 0 else dh.max()
+                else:
+                    c_min, c_max = 0, 24
+                cluster_info_final[cid] = {'min': c_min, 'max': c_max, 'mean': dh.mean(), 'count': len(dh)}
 
             save_models(pair, final_reg_models, final_clf, flow_name, extra_meta={
                 'best_combo': best_combo, 'cluster_info': cluster_info_final,
@@ -527,8 +648,8 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         ])
         print(f"  Cluster info (TrainVal): {info_str}")
 
-        # ══ TEST ONCE với best_combo ══
-        print(f"\n  [Test ONCE] {best_combo['cs_name']} | {best_combo['fo_name']} | {best_combo['reg_name']}")
+        # ══ TEST TRÊN TẤT CẢ COMBO ══
+        print(f"\n  [Đánh giá] Tính metrics trên Train (diagnostic) và Test cho tất cả 18 combos...")
 
         _cptest  = final_clf.predict_proba(X2_test)
         _cpred_t = final_clf.classes_[np.argmax(_cptest, axis=1)]
@@ -538,75 +659,86 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
         ch_t1 = np.array([pick_cluster_by_hour(h) for h in dep_h_t])
         ch_t2 = _cpred_t.copy()
         ch_t3 = np.where(_cmax_t >= HYBRID_THRESHOLD, _cpred_t, ch_t1)
-        _cs_test = {"C\u00e1ch 1 (Dominant Cluster)": ch_t1, "C\u00e1ch 2 (ML Classifier)": ch_t2, "C\u00e1ch 3 (Hybrid)": ch_t3}
+        _cs_test = {"Cách 1 (Dominant Cluster)": ch_t1, "Cách 2 (ML Classifier)": ch_t2, "Cách 3 (Hybrid)": ch_t3}
         _fo_test = {"Option 1 (Hour)": (X1_test, "Opt1"), "Option 2 (Full)": (X2_test, "Opt2")}
-        opt_key_t = _fo_test[best_combo['fo_name']][1]
-        X_opt_t   = _fo_test[best_combo['fo_name']][0]
-        chosen_t  = _cs_test[best_combo['cs_name']]
 
-        y_pred_test = np.full(len(y_test), np.nan)
-        for cid in np.unique(chosen_t):
-            idx_c = np.where(chosen_t == cid)[0]
-            key = (cid, best_combo['reg_name'], opt_key_t)
-            if key not in final_reg_models:
-                key = (dominant_cluster, best_combo['reg_name'], opt_key_t)
-            if key not in final_reg_models:
-                continue
-            cm = c_tv == cid
-            lo = y_tv[cm].min() - 2 if cm.any() else -2
-            hi = y_tv[cm].max() + 2 if cm.any() else 50
-            y_pred_test[idx_c] = np.clip(final_reg_models[key].predict(X_opt_t.iloc[idx_c]), lo, hi)
-
-        vt = ~np.isnan(y_pred_test)
-        test_metrics = compute_regression_metrics(y_test[vt], y_pred_test[vt]) if vt.sum() > 0 else \
-                       {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "MAPE": np.nan}
-        print(f"  [Test] MAE={test_metrics['MAE']:.3f}h | RMSE={test_metrics['RMSE']:.3f}h | "
-              f"R\u00b2={test_metrics['R2']:.4f} | MAPE={test_metrics['MAPE']:.1f}% (N={int(vt.sum())})")
-
-        # Train diagnostic
-        _cptrn    = final_clf.predict_proba(X2_train)
+        # Train diagnostic (evaluate on entire TrainVal)
+        _cptrn    = final_clf.predict_proba(X2_tv)
         _cpred_trn= final_clf.classes_[np.argmax(_cptrn, axis=1)]
         _cmax_trn = np.max(_cptrn, axis=1)
-        dep_h_trn = X1_train['departure_hour_numeric'].values
+        dep_h_trn = X1_tv['departure_hour_numeric'].values
         ch_trn1 = np.array([pick_cluster_by_hour(h) for h in dep_h_trn])
         ch_trn2 = _cpred_trn.copy()
         ch_trn3 = np.where(_cmax_trn >= HYBRID_THRESHOLD, _cpred_trn, ch_trn1)
-        _cs_trn = {"C\u00e1ch 1 (Dominant Cluster)": ch_trn1, "C\u00e1ch 2 (ML Classifier)": ch_trn2, "C\u00e1ch 3 (Hybrid)": ch_trn3}
-        _fo_trn = {"Option 1 (Hour)": (X1_train, "Opt1"), "Option 2 (Full)": (X2_train, "Opt2")}
-        X_opt_trn   = _fo_trn[best_combo['fo_name']][0]
-        opt_key_trn = _fo_trn[best_combo['fo_name']][1]
-        chosen_trn  = _cs_trn[best_combo['cs_name']]
+        _cs_trn = {"Cách 1 (Dominant Cluster)": ch_trn1, "Cách 2 (ML Classifier)": ch_trn2, "Cách 3 (Hybrid)": ch_trn3}
+        _fo_trn = {"Option 1 (Hour)": (X1_tv, "Opt1"), "Option 2 (Full)": (X2_tv, "Opt2")}
+        test_metrics, train_metrics = {}, {}
 
-        y_pred_trn = np.full(len(y_train), np.nan)
-        for cid in np.unique(chosen_trn):
-            idx_c = np.where(chosen_trn == cid)[0]
-            key = (cid, best_combo['reg_name'], opt_key_trn)
-            if key not in final_reg_models:
-                key = (dominant_cluster, best_combo['reg_name'], opt_key_trn)
-            if key not in final_reg_models:
-                continue
-            cm = c_tv == cid
-            lo = y_tv[cm].min() - 2 if cm.any() else -2
-            hi = y_tv[cm].max() + 2 if cm.any() else 50
-            y_pred_trn[idx_c] = np.clip(final_reg_models[key].predict(X_opt_trn.iloc[idx_c]), lo, hi)
-        vtrn = ~np.isnan(y_pred_trn)
-        train_metrics = compute_regression_metrics(y_train[vtrn], y_pred_trn[vtrn]) if vtrn.sum() > 0 else \
-                        {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "MAPE": np.nan}
+        for cs_name in ["Cách 1 (Dominant Cluster)", "Cách 2 (ML Classifier)", "Cách 3 (Hybrid)"]:
+            for fo_name in ["Option 1 (Hour)", "Option 2 (Full)"]:
+                for reg_name in ["LR", "RF", "LGBM"]:
+                    # --- Test ---
+                    opt_key_t = _fo_test[fo_name][1]
+                    X_opt_t   = _fo_test[fo_name][0]
+                    chosen_t  = _cs_test[cs_name]
+                    y_pred_test = np.full(len(y_test), np.nan)
+                    
+                    for cid in np.unique(chosen_t):
+                        idx_c = np.where(chosen_t == cid)[0]
+                        key = (cid, reg_name, opt_key_t)
+                        if key not in final_reg_models:
+                            key = (dominant_cluster, reg_name, opt_key_t)
+                        if key not in final_reg_models:
+                            continue
+                        lo = y_tv.min() - 2 if len(y_tv) > 0 else -2
+                        hi = y_tv.max() + 2 if len(y_tv) > 0 else 50
+                        y_pred_test[idx_c] = np.clip(final_reg_models[key].predict(X_opt_t.iloc[idx_c]), lo, hi)
+            
+                    vt = ~np.isnan(y_pred_test)
+                    tm = compute_regression_metrics(y_test[vt], y_pred_test[vt]) if vt.sum() > 0 else \
+                                   {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "MAPE": np.nan}
+                    
+                    # --- Train diagnostic ---
+                    opt_key_trn = _fo_trn[fo_name][1]
+                    X_opt_trn   = _fo_trn[fo_name][0]
+                    chosen_trn  = _cs_trn[cs_name]
+                    y_pred_trn = np.full(len(y_tv), np.nan)
+                    
+                    for cid in np.unique(chosen_trn):
+                        idx_c = np.where(chosen_trn == cid)[0]
+                        key = (cid, reg_name, opt_key_trn)
+                        if key not in final_reg_models:
+                            key = (dominant_cluster, reg_name, opt_key_trn)
+                        if key not in final_reg_models:
+                            continue
+                        lo = y_tv.min() - 2 if len(y_tv) > 0 else -2
+                        hi = y_tv.max() + 2 if len(y_tv) > 0 else 50
+                        y_pred_trn[idx_c] = np.clip(final_reg_models[key].predict(X_opt_trn.iloc[idx_c]), lo, hi)
+                    
+                    vtrn = ~np.isnan(y_pred_trn)
+                    trm = compute_regression_metrics(y_tv[vtrn], y_pred_trn[vtrn]) if vtrn.sum() > 0 else \
+                                    {"MAE": np.nan, "RMSE": np.nan, "R2": np.nan, "MAPE": np.nan}
+                    
+                    if cs_name == best_combo['cs_name'] and fo_name == best_combo['fo_name'] and reg_name == best_combo['reg_name']:
+                        test_metrics = tm
+                        train_metrics = trm
+                        print(f"  [Test Best Combo] MAE={test_metrics['MAE']:.3f}h | RMSE={test_metrics['RMSE']:.3f}h | "
+                              f"R²={test_metrics['R2']:.4f} | MAPE={test_metrics['MAPE']:.1f}% (N={int(vt.sum())})")
 
-        # L\u01b0u k\u1ebft qu\u1ea3
-        combo_info = {
-            "cluster_selection": best_combo['cs_name'],
-            "feature_option":    best_combo['fo_name'],
-            "regression_model":  best_combo['reg_name'],
-        }
-        for split_name, met, n_s in [
-            ("Train (diagnostic)", train_metrics, int(vtrn.sum())),
-            ("Test",               test_metrics,  int(vt.sum())),
-        ]:
-            all_results.append({
-                "data_split": split_name, "flow": flow_name, "pair": pair,
-                **combo_info, "n_samples": n_s, **met,
-            })
+                    # Lưu kết quả
+                    combo_info = {
+                        "cluster_selection": cs_name,
+                        "feature_option":    fo_name,
+                        "regression_model":  reg_name,
+                    }
+                    for split_name, met, n_s in [
+                        ("Train (diagnostic)", trm, int(vtrn.sum())),
+                        ("Test",               tm,  int(vt.sum())),
+                    ]:
+                        all_results.append({
+                            "data_split": split_name, "flow": flow_name, "pair": pair,
+                            **combo_info, "n_samples": n_s, **met,
+                        })
 
         # Th\u1ed1ng k\u00ea cluster t\u1eeb trainval
         cluster_stats = []
@@ -633,6 +765,15 @@ def run_multi_pipeline(df, pairs, t_col_1, t_col_2, flow_name, is_dest_flow):
             "clf_f1": clf_f1,
             "hybrid_ml_rate": hybrid_ml_rate,
         })
+
+    n_kept = n_candidates - len(skip_reasons)
+    print(f"\n{'─'*70}")
+    print(f"  TỔNG KẾT [{flow_name}]: {n_candidates} cặp ứng viên → giữ lại {n_kept}, bỏ qua {len(skip_reasons)}")
+    if skip_reasons:
+        print("  Chi tiết các cặp bị bỏ qua:")
+        for p, reason in skip_reasons.items():
+            print(f"    - {p}: {reason}")
+    print(f"{'─'*70}")
 
     return all_results, flow_pair_reports
 
@@ -679,21 +820,24 @@ def build_html_report(results_by_flow, summary_df):
   td { padding: 10px 16px; border-bottom: 1px solid #f1f5f9; }
   tr:nth-child(even) td { background: #fafafa; }
   tr:hover td { background: #eff6ff; }
-  .pair-card { background: white; border-radius: 10px; margin-bottom: 24px; overflow: hidden;
-                 box-shadow: 0 1px 4px rgba(0,0,0,0.08); }
-  .pair-header { background: #f8fafc; padding: 14px 20px; border-bottom: 1px solid #e2e8f0;
-                   display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; }
-  .pair-title { font-size: 15px; font-weight: 700; color: #1e293b; }
+  .pair-card { background: white; border-radius: 8px; margin-bottom: 24px; overflow: hidden;
+                 border: 1px solid #e2e8f0; box-shadow: 0 2px 4px rgba(0,0,0,0.04); }
+  .pair-header { background: #f8fafc; padding: 16px 20px; border-bottom: 1px solid #e2e8f0;
+                   display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+  .pair-title { font-size: 16px; font-weight: 700; color: #334155; }
   .pair-meta { display: flex; gap: 10px; flex-wrap: wrap; }
-  .meta-badge { background: #eff6ff; color: #1d4ed8; padding: 4px 10px; border-radius: 6px;
-                  font-size: 11px; font-weight: 600; }
-  .meta-badge.green { background: #ecfdf5; color: #065f46; }
+  .meta-badge { background: #ffffff; color: #64748b; padding: 4px 10px; border-radius: 6px;
+                  font-size: 12px; font-weight: 500; border: 1px solid #e2e8f0; }
+  .meta-badge.strong { color: #0f172a; font-weight: 600; background: #f1f5f9; }
   .pair-body { padding: 20px; }
   .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
   .chart-container { min-height: 400px; }
-  .section-title { font-size: 14px; font-weight: 700; color: #334155; margin: 16px 0 8px; }
-  .highlight { background: #fef3c7; padding: 2px 6px; border-radius: 3px; font-weight: 700; }
-  td.best { background: #d1fae5; font-weight: 700; color: #065f46; }
+  .section-title { font-size: 14px; font-weight: 700; color: #334155; margin: 16px 0 12px; border-bottom: 1px solid #e2e8f0; padding-bottom: 6px; }
+  .test-box { margin-bottom: 24px; padding: 16px 20px; background: #f8fafc; border: 1px solid #e2e8f0;
+                border-left: 4px solid #3b82f6; border-radius: 6px; }
+  .test-box h3 { margin-bottom: 12px; color: #1e293b; font-size: 15px; font-weight: 700; }
+  tr.best-row td { font-weight: 600; background: #f0fdf4; color: #166534; }
+  tr.best-row td:first-child { border-left: 3px solid #22c55e; }
 </style>
 </head><body>
 <h1>Multi-Strategy Regression Pipeline</h1>
@@ -706,11 +850,10 @@ def build_html_report(results_by_flow, summary_df):
       <div class="note-section"><b>Pipeline (mỗi cặp kho)</b>
         Bước 1: Tách Test 20% TRƯỚC (không đụng tới cho đến bước cuối) →
         Bước 2: DBSCAN phân cụm y_offset CHỈ trên trainval (80%) →
-        Bước 3: Split trainval → Train 75% / Val 25% →
-        Bước 4: Train Regression per cluster trên Train (LR/RF/LGBM × Opt1/Opt2) →
-        Bước 5: Val Selection (chọn best combo theo Val MAE thấp nhất) →
-        Bước 6: Retrain final models trên toàn bộ trainval với best combo →
-        Bước 7: Test ONCE – chỉ chạy đúng 1 lần trên test với best combo
+        Bước 3: Val Selection bằng K-Fold CV trên toàn bộ trainval (mỗi điểm dữ liệu
+        được dùng làm validation đúng 1 lần, out-of-fold) → chọn best combo theo MAE gộp thấp nhất →
+        Bước 4: Retrain final models trên toàn bộ trainval với best combo →
+        Bước 5: Test ONCE – chỉ chạy đúng 1 lần trên test với best combo
       </div>
       <div class="note-section"><b>Chiến lược chọn cụm</b>
         <u>Cách 1 (Dominant Cluster)</u>: Với mỗi khung giờ, dùng cụm chiếm đa số trong training – đơn giản, ổn định<br>
@@ -733,7 +876,6 @@ def build_html_report(results_by_flow, summary_df):
         <u>MAE</u>: Sai số trung bình (giờ) – nhỏ hơn = tốt hơn<br>
         <u>RMSE</u>: Nhạy với outlier (giờ) – nhỏ hơn = tốt hơn<br>
         <u>R²</u>: Mức độ giải thích biến động – càng gần 1 càng tốt (âm = tệ hơn đoán trung bình)<br>
-        <u>MAPE</u>: Sai số phần trăm – nhỏ hơn = tốt hơn<br>
         <u>MAPE</u>: Sai số phần trăm – nhỏ hơn = tốt hơn
       </div>
     </div>
@@ -775,6 +917,9 @@ def build_html_report(results_by_flow, summary_df):
             y_maes = []
             hover_texts = []
 
+            def _fmt(v, fmt=".3f", suffix=""):
+                return f"{v:{fmt}}{suffix}" if pd.notna(v) else "N/A"
+
             for row_idx, r in grp.iterrows():
                 row_num = row_idx + 1
                 td_html = "".join([
@@ -782,12 +927,12 @@ def build_html_report(results_by_flow, summary_df):
                     for col in cols_to_group
                 ])
                 rows += (f"<tr><td style='color:#64748b;font-weight:600;'>#{row_num}</td>{td_html}"
-                         f"<td>{r['MAE']:.3f}</td><td>{r['RMSE']:.3f}</td>"
-                         f"<td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
+                         f"<td>{_fmt(r['MAE'])}</td><td>{_fmt(r['RMSE'])}</td>"
+                         f"<td>{_fmt(r['R2'], '.4f')}</td><td>{_fmt(r['MAPE'], '.1f', '%')}</td></tr>")
                 x_labels.append(f"#{row_num}")
                 y_maes.append(r["MAE"])
                 detail = " | ".join([f"{header_map.get(col, col)}: {r[col]}" for col in cols_to_group])
-                hover_texts.append(f"#{row_num} {detail}<br>MAE: {r['MAE']:.3f}h")
+                hover_texts.append(f"#{row_num} {detail}<br>MAE: {_fmt(r['MAE'])}h")
 
             table_html = (
                 '<div class="avg-table-wrap">'
@@ -828,13 +973,26 @@ def build_html_report(results_by_flow, summary_df):
                 raw_mae_vals = df.loc[mask, 'MAE'].dropna()
                 raw_mae_vals = raw_mae_vals[raw_mae_vals.abs() < 1000]  # loại outlier
                 raw_mae_list = raw_mae_vals.tolist()  # buộc dùng list để tránh binary encoding khi serialize JSON
-                
+
                 plot_row = row_idx // COLS_PER_ROW + 1
                 plot_col = row_idx % COLS_PER_ROW + 1
                 color = "#3B82F6"
-                
+                axis_idx = (plot_row - 1) * COLS_PER_ROW + plot_col if (plot_row, plot_col) != (1, 1) else ''
+                xref_id, yref_id = f"x{axis_idx}", f"y{axis_idx}"
+
                 detail_label = " | ".join([f"{r[c]}" for c in cols_to_group])
-                
+
+                # Cỡ mẫu quá nhỏ (<3 điểm) thì histogram không mang ý nghĩa thống kê (chỉ 1-2 cột lẻ
+                # dễ bị hiểu nhầm là "vẽ sai") → hiển thị rõ số lượng mẫu thay vì vẽ histogram rối.
+                if len(raw_mae_list) < 3:
+                    fig.add_annotation(
+                        x=0.5, y=0.5, xref=f"{xref_id} domain", yref=f"{yref_id} domain",
+                        text=f"n={len(raw_mae_list)} (quá ít để vẽ histogram)",
+                        showarrow=False, font=dict(size=10, color="#94a3b8"),
+                        row=plot_row, col=plot_col,
+                    )
+                    continue
+
                 fig.add_trace(go.Histogram(
                     x=raw_mae_list,
                     nbinsx=15,
@@ -844,29 +1002,42 @@ def build_html_report(results_by_flow, summary_df):
                     showlegend=False,
                     hovertemplate=f"#{row_idx+1} {detail_label}<br>MAE: %{{x:.2f}}h<br>Count: %{{y}}<extra></extra>",
                 ), row=plot_row, col=plot_col)
-                if len(raw_mae_list) > 0:
-                    mean_val = float(raw_mae_vals.mean())
-                    fig.add_vline(
-                        x=mean_val,
-                        line_width=2,
-                        line_dash="dash",
-                        line_color="#EF4444",
-                        row=plot_row,
-                        col=plot_col,
-                    )
-                    # Annotation hiển thị giá trị mean phía trên đường
-                    fig.add_annotation(
-                        x=mean_val,
-                        y=1.0,
-                        xref=f"x{ (plot_row - 1) * COLS_PER_ROW + plot_col if (plot_row, plot_col) != (1, 1) else '' }",
-                        yref=f"y{ (plot_row - 1) * COLS_PER_ROW + plot_col if (plot_row, plot_col) != (1, 1) else '' } domain",
-                        text=f"Mean: {mean_val:.2f}h",
-                        showarrow=False,
-                        yshift=10,
-                        font=dict(size=10, color="#EF4444"),
-                        row=plot_row,
-                        col=plot_col,
-                    )
+
+                mean_val = float(raw_mae_vals.mean())
+                fig.add_vline(
+                    x=mean_val,
+                    line_width=2,
+                    line_dash="dash",
+                    line_color="#EF4444",
+                    row=plot_row,
+                    col=plot_col,
+                )
+                # Annotation hiển thị giá trị mean — đặt ở y=0.88 (domain) thay vì y=1.0 để
+                # tránh chồng lấn lên subplot title (title luôn nằm ở đúng mép trên y=1.0).
+                fig.add_annotation(
+                    x=mean_val,
+                    y=0.88,
+                    xref=f"{xref_id} domain",
+                    yref=f"{yref_id} domain",
+                    text=f"Mean: {mean_val:.2f}h",
+                    showarrow=False,
+                    yanchor="top",
+                    bgcolor="rgba(255,255,255,0.75)",
+                    font=dict(size=10, color="#EF4444"),
+                    row=plot_row,
+                    col=plot_col,
+                )
+            # Ẩn các ô dư trong lưới (khi n_groups không chia hết cho COLS_PER_ROW): lưới subplot
+            # cố định n_rows_plot x n_cols_plot có thể nhiều hơn số nhóm dữ liệu thực tế (VD: 4 nhóm
+            # nhưng lưới 2x3=6 ô → 2 ô cuối không có trace/annotation nào, hiển thị như khung trống
+            # trơn trọi dễ bị hiểu nhầm là lỗi). Ẩn hẳn axis của các ô này để chúng biến mất thị giác.
+            total_slots = n_rows_plot * n_cols_plot
+            for slot_idx in range(n_groups, total_slots):
+                _row = slot_idx // COLS_PER_ROW + 1
+                _col = slot_idx % COLS_PER_ROW + 1
+                fig.update_xaxes(visible=False, row=_row, col=_col)
+                fig.update_yaxes(visible=False, row=_row, col=_col)
+
             chart_height = 320 * n_rows_plot
             fig.update_layout(
                 height=chart_height,
@@ -875,7 +1046,10 @@ def build_html_report(results_by_flow, summary_df):
                 plot_bgcolor="#FAFAFA",
                 paper_bgcolor="#FFFFFF",
             )
-            fig.update_xaxes(title_text="MAE (h)")
+            for slot_idx in range(n_groups):
+                _row = slot_idx // COLS_PER_ROW + 1
+                _col = slot_idx % COLS_PER_ROW + 1
+                fig.update_xaxes(title_text="MAE (h)", row=_row, col=_col)
             # fig.update_yaxes(title_text="Count")
             
             chart_id = f"avg_chart_{idx}"
@@ -894,7 +1068,7 @@ def build_html_report(results_by_flow, summary_df):
         avg_html = ""
         for i, (col, lbl) in enumerate([
             ("flow",               "Theo Luồng"),
-            ("data_split",         "Theo Tập (Train/Val/Test)"),
+            ("data_split",         "Theo Tập (Train/Test)"),
             ("cluster_selection",  "Theo Chiến lược chọn cụm"),
             ("feature_option",     "Theo Feature Option"),
             ("regression_model",   "Theo Regression Model"),
@@ -918,12 +1092,15 @@ def build_html_report(results_by_flow, summary_df):
         combo_grp = combo_grp.sort_values(combo_cols)
         
         combo_rows = ""
+        def _fmt_combo(v, fmt=".3f", suffix=""):
+            return f"{v:{fmt}}{suffix}" if pd.notna(v) else "N/A"
         for _, r in combo_grp.iterrows():
             split_td = f"<td>{r['data_split']}</td>" if 'data_split' in combo_cols else ""
             combo_rows += (f"<tr>{split_td}<td>{r['flow']}</td><td>{r['cluster_selection']}</td>"
                            f"<td>{r['feature_option']}</td><td>{r['regression_model']}</td>"
-                           f"<td><b>{r['MAE']:.3f}</b></td>"
-                           f"<td>{r['RMSE']:.3f}</td><td>{r['R2']:.4f}</td><td>{r['MAPE']:.1f}%</td></tr>")
+                           f"<td><b>{_fmt_combo(r['MAE'])}</b></td>"
+                           f"<td>{_fmt_combo(r['RMSE'])}</td><td>{_fmt_combo(r['R2'], '.4f')}</td>"
+                           f"<td>{_fmt_combo(r['MAPE'], '.1f', '%')}</td></tr>")
 
         table_html = f"""
   <table id="comboSummaryTable">
@@ -975,22 +1152,25 @@ def build_html_report(results_by_flow, summary_df):
                 <td>{mape_str}</td>
             </tr>"""
 
+        _has_split = 'data_split' in summary_df.columns
+        _i = (lambda base: base + 1 if _has_split else base)
+
         html += f"""
 <div class="summary-card">
   <h2>Bảng tổng hợp so sánh tất cả tổ hợp chiến lược</h2>
   <table id="summaryTable">
     <thead><tr>
-      {'<th class="sortable" onclick="sortTable(0)">Split ↕</th>' if 'data_split' in summary_df.columns else ''}
-      <th class="sortable" onclick="sortTable({'1' if 'data_split' in summary_df.columns else '0'})">Cặp Kho ↕</th>
-      <th class="sortable" onclick="sortTable({'2' if 'data_split' in summary_df.columns else '1'})">Luồng ↕</th>
-      <th class="sortable" onclick="sortTable({'3' if 'data_split' in summary_df.columns else '2'})">Chọn Cụm ↕</th>
-      <th class="sortable" onclick="sortTable({'4' if 'data_split' in summary_df.columns else '3'})">Features ↕</th>
-      <th class="sortable" onclick="sortTable({'5' if 'data_split' in summary_df.columns else '4'})">Regression ↕</th>
-      <th class="sortable" onclick="sortTable({'6' if 'data_split' in summary_df.columns else '5'})">N Test ↕</th>
-      <th class="sortable" onclick="sortTable({'7' if 'data_split' in summary_df.columns else '6'})">MAE (h) ↕</th>
-      <th class="sortable" onclick="sortTable({'8' if 'data_split' in summary_df.columns else '7'})">RMSE (h) ↕</th>
-      <th class="sortable" onclick="sortTable({'9' if 'data_split' in summary_df.columns else '8'})">R² ↕</th>
-      <th class="sortable" onclick="sortTable({'10' if 'data_split' in summary_df.columns else '9'})">MAPE ↕</th>
+      {f'<th class="sortable" onclick="sortTable(0, \'summaryTable\')">Split ↕</th>' if _has_split else ''}
+      <th class="sortable" onclick="sortTable({_i(0)}, 'summaryTable')">Cặp Kho ↕</th>
+      <th class="sortable" onclick="sortTable({_i(1)}, 'summaryTable')">Luồng ↕</th>
+      <th class="sortable" onclick="sortTable({_i(2)}, 'summaryTable')">Chọn Cụm ↕</th>
+      <th class="sortable" onclick="sortTable({_i(3)}, 'summaryTable')">Features ↕</th>
+      <th class="sortable" onclick="sortTable({_i(4)}, 'summaryTable')">Regression ↕</th>
+      <th class="sortable" onclick="sortTable({_i(5)}, 'summaryTable')">N Test ↕</th>
+      <th class="sortable" onclick="sortTable({_i(6)}, 'summaryTable')">MAE (h) ↕</th>
+      <th class="sortable" onclick="sortTable({_i(7)}, 'summaryTable')">RMSE (h) ↕</th>
+      <th class="sortable" onclick="sortTable({_i(8)}, 'summaryTable')">R² ↕</th>
+      <th class="sortable" onclick="sortTable({_i(9)}, 'summaryTable')">MAPE ↕</th>
     </tr></thead>
     <tbody>{summary_rows}</tbody>
   </table>
@@ -1024,10 +1204,9 @@ def build_html_report(results_by_flow, summary_df):
                 is_best = (vs['cs_name'] == best_combo.get('cs_name') and 
                            vs['fo_name'] == best_combo.get('fo_name') and 
                            vs['reg_name'] == best_combo.get('reg_name'))
-                bg_color = "#d1fae5" if is_best else "transparent"
-                fw = "bold" if is_best else "normal"
-                combo_rows += f"""<tr style='background:{bg_color}; font-weight:{fw}'>
-                    <td>{vs['cs_name']}</td>
+                row_cls = "best-row" if is_best else ""
+                combo_rows += f"""<tr class='{row_cls}'>
+                    <td>{vs['cs_name']}{' ★' if is_best else ''}</td>
                     <td>{vs['fo_name']}</td>
                     <td>{vs['reg_name']}</td>
                     <td>{_f(vs['val_mae'])}</td><td>{_f(vs['val_rmse'])}</td>
@@ -1035,7 +1214,7 @@ def build_html_report(results_by_flow, summary_df):
                 </tr>"""
 
             # ── Bar Chart: MAE comparison on Val ──
-            colors_map = {"LR": "#3B82F6", "RF": "#10B981", "LGBM": "#F59E0B"}
+            colors_map = {"LR": "#cbd5e1", "RF": "#94a3b8", "LGBM": "#3b82f6"}
             fig = go.Figure()
             for reg_name in ["LR", "RF", "LGBM"]:
                 x_vals = []
@@ -1080,14 +1259,14 @@ def build_html_report(results_by_flow, summary_df):
       <span class="meta-badge">{rep.get('n_samples', 0):,} trainval samples</span>
       <span class="meta-badge">{rep.get('n_test', 0):,} test samples</span>
       <span class="meta-badge">{rep.get('n_clusters', 0)} cụm</span>
-      <span class="meta-badge green">Dominant: Cụm {rep.get('dominant_cluster', -1)}</span>
+      <span class="meta-badge strong">Dominant: Cụm {rep.get('dominant_cluster', -1)}</span>
       <span class="meta-badge">Clf Acc={rep.get('clf_acc', 0):.3f}</span>
       <span class="meta-badge">Hybrid ML: {rep.get('hybrid_ml_rate', 0)*100:.1f}%</span>
     </div>
   </div>
   <div class="pair-body">
-    <div style="margin-bottom: 20px; padding: 15px; background: #e0f2fe; border-left: 4px solid #0284c7; border-radius: 4px;">
-      <h3 style="margin-bottom: 10px; color: #0369a1;">Kết quả Final Test (chỉ chạy 1 lần) trên {rep.get('n_test', 0):,} bills</h3>
+    <div class="test-box">
+      <h3>Kết quả Final Test (chỉ chạy 1 lần) trên {rep.get('n_test', 0):,} bills</h3>
       <p><b>Best Combo:</b> {best_combo.get('cs_name')} | {best_combo.get('fo_name')} | {best_combo.get('reg_name')}</p>
       <div style="display: flex; gap: 40px; margin-top: 10px;">
         <div>
@@ -1215,6 +1394,7 @@ if __name__ == "__main__":
     print("  LUỒNG 1: KHO GỬI → KHO 1A NGUỒN")
     print("█" * 70)
     df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "tong_kg", "actual_weight", False)
+    print(f"  → {len(pairs_o)} cặp kho ứng viên (top {N_TOP} cặp tỉnh × tối đa 3 cặp kho/tỉnh)")
     res_o, rep_o = run_multi_pipeline(df_o_proc, pairs_o, "time_o", "time_o1a",
                                        "Kho gửi → Kho 1A", is_dest_flow=False)
     all_results.extend(res_o)
@@ -1225,6 +1405,7 @@ if __name__ == "__main__":
     print("  LUỒNG 2: KHO 1A ĐÍCH → KHO NHẬN")
     print("█" * 70)
     df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "tong_kg", "actual_weight", True)
+    print(f"  → {len(pairs_d)} cặp kho ứng viên (top {N_TOP} cặp tỉnh × tối đa 3 cặp kho/tỉnh)")
     res_d, rep_d = run_multi_pipeline(df_d_proc, pairs_d, "time_d1a", "time_d",
                                        "Kho 1A → Kho nhận", is_dest_flow=True)
     all_results.extend(res_d)

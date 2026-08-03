@@ -12,7 +12,7 @@ from plotly.subplots import make_subplots
 
 N_TOP = 10 
 DBSCAN_EPS = 0.5
-DBSCAN_MIN_SAMPLES = 150
+DBSCAN_MIN_SAMPLES = 200
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "output_plot")
 CONFIDENCE_THRESHOLD = 0.8
 
@@ -31,22 +31,56 @@ EXCLUDE = [
     'Bưu cục Dự Án Vgreen Văn Giang'
 ]
 
-def get_top_pairs(df, col_a, col_b, sort_by, is_dest_flow): 
-    df = df.copy()  
-    if is_dest_flow: 
-        df = df[~df[col_b].isin(EXCLUDE)] 
-    else: 
+def get_top_pairs(df, col_a, col_b, sort_by, is_dest_flow):
+    """Lấy top 10 cặp tỉnh có số lượng bill lớn nhất, mỗi cặp tỉnh lấy top 5 cặp kho"""
+    df = df.copy()
+    if is_dest_flow:
+        df = df[~df[col_b].isin(EXCLUDE)]
+    else:
         df = df[~df[col_a].isin(EXCLUDE)]
+    key = "so_bill" if sort_by == "bill_count" else "tong_kg"
+    # Đọc danh sách kho để lấy thông tin tỉnh
+    wh_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "warehouse.csv")
+    wh = pd.read_csv(wh_path, usecols=['name', 'province'])
+    
+    # Merge province A
+    df = pd.merge(df, wh, left_on=[col_a], right_on=['name'], how='left')
+    df = df.drop(columns=['name']).rename(columns={'province': f'{col_a}_province'})
+    
+    # Merge province B
+    df = pd.merge(df, wh, left_on=[col_b], right_on=['name'], how='left')
+    df = df.drop(columns=['name']).rename(columns={'province': f'{col_b}_province'})
+
+    df["pair"] = df[col_a].astype(str) + " (" + df[f'{col_a}_province'].astype(str) + ") → " + df[col_b].astype(str) + " (" + df[f'{col_b}_province'].astype(str) + ")"
+
+    # Lọc dữ liệu theo luồng
+    if is_dest_flow:
+        df = df[df['destination_province'] == df[f'{col_b}_province']]
+    else:
+        df = df[df['origin_province'] == df[f'{col_a}_province']]
+
+    # Lấy top cặp tỉnh theo số lượng bill
+    agg_prov = df.groupby([f'{col_a}_province', f'{col_b}_province']).agg(
+        so_bill=('bill_code', 'nunique'),
+        tong_kg=('actual_weight', 'sum')
+    ).reset_index()
+    top_prov = agg_prov.nlargest(N_TOP, key)
+    
+    # Lấy top cặp kho cho mỗi cặp tỉnh
+    final_pairs = []
+    for _, row in top_prov.iterrows():
+        prov_a = row[f'{col_a}_province']
+        prov_b = row[f'{col_b}_province']
         
-    df['pair'] = df[col_a].astype(str) + ' -> ' + df[col_b].astype(str) 
-    check_col = col_b if is_dest_flow else col_a 
-    agg = df.groupby(['pair', check_col]).agg(
-        so_bill = ('bill_code', 'nunique'),
-        tong_kg = ('actual_weight', 'sum')
-    ).reset_index() 
-    key = "so_bill" if sort_by == 'bill_count' else "tong_kg"
-    top = agg.nlargest(N_TOP, key) 
-    return df, top['pair'].tolist() 
+        sub_df = df[(df[f'{col_a}_province'] == prov_a) & (df[f'{col_b}_province'] == prov_b)]
+        agg_kho = sub_df.groupby(["pair"]).agg(
+            so_bill=('bill_code', 'nunique'),
+            tong_kg=('actual_weight', 'sum')
+        ).reset_index()
+        top_kho = agg_kho.nlargest(3, key)
+        final_pairs.extend(top_kho['pair'].tolist())
+        
+    return df, final_pairs
 
 def transform_province(series, top = 10): 
     s = series.copy() 
@@ -483,7 +517,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("  LUỒNG 1: KHO GỬI → KHO 1A NGUỒN")
     print("=" * 70)
-    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "bill_count", False)
+    df_o_proc, pairs_o = get_top_pairs(df_o, "kho_o", "kho_o1a", "tong_kg", False)
     sum_o, imp_o, rep_o = run_rf_pipeline(df_o_proc, pairs_o, "time_o", "time_o1a", "Kho gửi → Kho 1A", is_dest_flow=False)
     
     all_summary.extend(sum_o)
@@ -494,7 +528,7 @@ if __name__ == "__main__":
     print("\n" + "=" * 70)
     print("  LUỒNG 2: KHO 1A ĐÍCH → KHO NHẬN")
     print("=" * 70)
-    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "bill_count", True)
+    df_d_proc, pairs_d = get_top_pairs(df_d, "kho_d1a", "kho_d", "tong_kg", True)
     sum_d, imp_d, rep_d = run_rf_pipeline(df_d_proc, pairs_d, "time_d1a", "time_d", "Kho 1A → Kho nhận", is_dest_flow=True)
 
     all_summary.extend(sum_d)
