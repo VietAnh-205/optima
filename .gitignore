@@ -2,4 +2,6 @@
 *.png 
 *.html
 *.md 
+*.pkl
 output_plot/
+analysis_data/output_plot/ 
