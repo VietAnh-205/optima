@@ -1,10 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
-forecasting/model_io.py
-========================
-Save / Load model bundle (.pkl) bằng joblib.
-Mỗi model bundle chứa tất cả thứ cần thiết để predict — không cần data gốc.
-"""
+
 
 import os
 import re
@@ -77,7 +72,10 @@ def load_bundle(path: str) -> dict:
     if not isinstance(bundle, dict):
         raise ValueError(f"Expected dict, got {type(bundle).__name__}")
 
-    required_keys = ["model", "feature_cols", "categorical_features"]
+    if "segment_models" not in bundle and "model" not in bundle:
+        raise ValueError("Model bundle must contain either 'segment_models' or 'model'")
+
+    required_keys = ["feature_cols", "categorical_features"]
     missing = [k for k in required_keys if k not in bundle]
     if missing:
         raise ValueError(f"Model bundle is missing required keys: {missing}")

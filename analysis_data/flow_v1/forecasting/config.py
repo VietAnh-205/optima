@@ -5,49 +5,66 @@ forecasting/config.py
 Constants & hyperparameters cho pipeline Forecasting LightGBM.
 Tất cả module khác import từ đây → thay đổi 1 chỗ, áp dụng mọi nơi.
 """
+import math
 
 # ── Snapshot evaluation ─────────────────────────────────────────────────
+SNAPSHOT_HOURS = [20]
 SNAPSHOT_HOUR = 20
 SNAPSHOT_MINUTE = 0
 
 # ── Processing ───────────────────────────────────────────────────────────
-CHUNK_SIZE = 5000
+CHUNK_SIZE = 500_000
 
-# ── Train/Test split ─────────────────────────────────────────────────────
-TRAIN_RATIO = 0.9
-
-# ── Test sampling ────────────────────────────────────────────────────────
-SAMPLE_SIZE = 100_000
+# ── Train / Val / Test split ─────────────────────────────────────────────
+TRAIN_SPLIT = 0.75
+VAL_SPLIT = 0.15
+TEST_SPLIT = 0.10   # = 1.0 - TRAIN_SPLIT - VAL_SPLIT
 
 # ── Rare category ────────────────────────────────────────────────────────
 RARE_CATEGORY_MIN_COUNT = 50
 
-# ── Sample weight cho bản OUT-missing ────────────────────────────────────
-MISSING_OUT_WEIGHT = 0.5
+# ── Multi-modal threshold ────────────────────────────────────────────────
+MIN_SAMPLES_MULTIMODAL = 200
 
 # ── Outlier threshold ────────────────────────────────────────────────────
 ARRIVAL_OFFSET_MAX_HOURS = 72.0
 
 # ── LightGBM hyperparameters ────────────────────────────────────────────
-LGBM_PARAMS = {
-    "objective": "regression",
-    "n_estimators": 1000,
-    "learning_rate": 0.03,
-    "num_leaves": 31,
-    "max_depth": -1,
-    "min_child_samples": 20,
-    "subsample": 0.8,
-    "colsample_bytree": 0.8,
-    "random_state": 42,
-    "n_jobs": -1,
-}
+def lgbm_spec(n_samples: int) -> dict:
+    """Trả về bộ tham số co giãn theo quy mô dữ liệu của từng phân khúc."""
+    n = max(int(n_samples), 1)
+    
+    depth = max(4, min(10, int(math.log2(max(n, 2)))))
+    leaves = max(15, min(63, int(n / 100)))
+    leaf = max(1, min(50, int(n * 0.02)))  # Tỷ lệ theo n, tránh ép sàn 10 khi n nhỏ
+    lr = 0.05 if n < 5000 else 0.03
+    n_est = 300 if n < 5000 else 800
 
-# ── Feature columns (41 features) ───────────────────────────────────────
+    return {
+        "objective": "regression",
+        "n_estimators": n_est,
+        "learning_rate": lr,
+        "num_leaves": leaves,
+        "max_depth": depth,
+        "min_child_samples": leaf,
+        "subsample": 0.8,
+        "colsample_bytree": 0.8,
+        "reg_alpha": 0.1,
+        "reg_lambda": 0.1,
+        "random_state": 42,
+        "n_jobs": -1,
+        "verbose": -1
+    }
+
+# ── Feature columns ─────────────────────────────────────────────────────
 FEATURE_COLS = [
     # Stage features
     "warehouse_source",
     "io_status_source",
     "io_time_source",
+    "snapshot_hour_numeric",  # Giờ lúc lấy snapshot (0-24h)
+    "hours_since_last_scan",  # Thời gian ngâm kho tính đến lúc snapshot
+    "stage_depth",            # Chặng thứ mấy của bill
     # Basic categorical
     "VD_type",
     "origin_province",
@@ -55,21 +72,7 @@ FEATURE_COLS = [
     "destination_province",
     "destination_district",
     "service",
-    # Creation time
-    "creation_hour",
-    "creation_day_of_week",
-    "creation_day_of_month",
-    "creation_month",
-    "creation_week_of_year",
-    "creation_day_of_year",
-    "creation_weekend",
     # Estimated delivery
-    "estimated_day_of_week",
-    "estimated_day_of_month",
-    "estimated_month",
-    "estimated_week_of_year",
-    "estimated_day_of_year",
-    "estimated_weekend",
     "estimated_delivery_days",
     "estimated_delivery_days_cat",
     # Date relationships
@@ -87,21 +90,15 @@ FEATURE_COLS = [
     # Route
     "province_route",
     "district_route",
-    "full_route",
     # Weight
     "actual_weight",
     "log_actual_weight",
     "weight_bin",
     # Interactions
     "service_VD_type",
-    "service_creation_dow",
-    "service_creation_hour",
-    "VD_type_creation_dow",
-    "route_service",
-    "route_VD_type",
 ]
 
-# ── Categorical features (19 features) ──────────────────────────────────
+# ── Categorical features ────────────────────────────────────────────────
 CATEGORICAL_FEATURES = [
     "warehouse_source",
     "io_status_source",
@@ -114,20 +111,15 @@ CATEGORICAL_FEATURES = [
     "estimated_delivery_days_cat",
     "province_route",
     "district_route",
-    "full_route",
     "weight_bin",
     "service_VD_type",
-    "service_creation_dow",
-    "service_creation_hour",
-    "VD_type_creation_dow",
-    "route_service",
-    "route_VD_type",
 ]
 
 # ── High cardinality columns (cần gộp rare → "OTHER") ───────────────────
 HIGH_CARD_COLS = [
-    "full_route",
+    "province_route",
     "district_route",
-    "route_service",
-    "route_VD_type",
+    "origin_district",
+    "destination_district",
+    "service_VD_type",
 ]

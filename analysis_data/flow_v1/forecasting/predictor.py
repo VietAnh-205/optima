@@ -1,9 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 forecasting/predictor.py
-=========================
-⭐ Hàm predict chính — ForecastingPredictor class.
-
+========================
 Sử dụng:
     from forecasting import ForecastingPredictor
 
@@ -12,9 +10,10 @@ Sử dụng:
     print(results[["bill_code", "predicted_arrival_offset_hours"]])
 """
 
+import numpy as np
 import pandas as pd
 
-from .config import FEATURE_COLS
+from .config import CATEGORICAL_FEATURES, FEATURE_COLS
 from .features import prepare_prediction_features
 from .model_io import load_bundle
 
@@ -38,7 +37,9 @@ class ForecastingPredictor:
             Đường dẫn tới file model_bundle.pkl
         """
         self.bundle = load_bundle(model_path)
-        self._model = self.bundle["model"]
+        self.segment_models = self.bundle.get("segment_models", {})
+        if not self.segment_models:
+            self.segment_models = {"OTHER": self.bundle.get("model")}
         self._feature_cols = self.bundle.get("feature_cols", FEATURE_COLS)
 
     @property
@@ -80,10 +81,10 @@ class ForecastingPredictor:
             bill_code                        — mã đơn (tự sinh nếu thiếu)
             warehouse_source                 — kho hiện tại
             io_status_source                 — trạng thái IN/OUT tại kho hiện tại
-            predicted_arrival_offset_hours   — số giờ dự đoán
+            predicted_arrival_offset_hours   — số giờ dự đoán (được clip >= 0)
             predicted_arrival_time           — datetime dự kiến đến kho 1A (nếu có io_time)
         """
-        # 1. Lưu giá trị gốc để hiển thị (trước khi align_categoricals làm mất giá trị lạ)
+        # 1. Lưu giá trị gốc để hiển thị (tránh mất giá trị lạ sau khi align)
         raw_warehouse = (
             df["warehouse_name"].astype(str)
             if "warehouse_name" in df.columns
@@ -95,30 +96,78 @@ class ForecastingPredictor:
             else df.get("io_status_source", pd.Series(dtype=str))
         )
 
-        # 2. Chuẩn bị features (align_categoricals chạy ở đây)
+        # 2. Chuẩn bị features
         result = prepare_prediction_features(df, self.bundle)
 
-        # 3. Predict (dùng categoricals đã align — KHÔNG thay đổi X trước bước này)
+        # 3. Predict bằng mô hình tương ứng cho từng warehouse_source
         X = result[self._feature_cols]
-        result["predicted_arrival_offset_hours"] = self._model.predict(X)
+        preds = np.zeros(len(X))
 
-        # 4. Restore giá trị gốc cho output SAU KHI predict xong
+        routing_src = raw_warehouse.fillna("OTHER").values
+        sources = np.unique(routing_src)
+        for src in sources:
+            mask = routing_src == src
+            if mask.sum() > 0:
+                model_info = self.segment_models.get(src)
+                if model_info is None:
+                    model_info = self.segment_models.get("OTHER")
+                if model_info is None and self.segment_models:
+                    first_key = next(iter(self.segment_models))
+                    model_info = self.segment_models[first_key]
+                if model_info is None:
+                    model_info = self.bundle.get("model")
+                if model_info is None:
+                    continue
+
+                X_t = X[mask]
+
+                if isinstance(model_info, dict) and model_info.get("type") == "multi":
+                    X_t_clf = X_t.copy()
+                    for c in CATEGORICAL_FEATURES:
+                        if c in X_t_clf.columns:
+                            if hasattr(X_t_clf[c], "cat") and X_t_clf[c].cat is not None:
+                                X_t_clf[c] = X_t_clf[c].cat.codes
+                            else:
+                                X_t_clf[c] = pd.Categorical(X_t_clf[c]).codes
+                    X_t_clf = X_t_clf.fillna(0)
+
+                    c_pred = model_info["classifier"].predict(X_t_clf)
+                    yp = np.zeros(len(X_t))
+                    for cid in np.unique(c_pred):
+                        idx_c = np.where(c_pred == cid)[0]
+                        if cid in model_info["regressors"]:
+                            yp[idx_c] = model_info["regressors"][cid].predict(X_t.iloc[idx_c])
+                        else:
+                            yp[idx_c] = np.mean([
+                                model_info["regressors"][k].predict(X_t.iloc[idx_c])
+                                for k in model_info["regressors"]
+                            ], axis=0)
+                    preds[mask] = yp
+                elif isinstance(model_info, dict) and model_info.get("type") == "single":
+                    preds[mask] = model_info["regressor"].predict(X_t)
+                else:
+                    preds[mask] = model_info.predict(X_t)
+
+        # #3: Clip kết quả >= 0 khi trả về cho người dùng
+        result["predicted_arrival_offset_hours"] = np.clip(preds, 0.0, None)
+
+        # 4. Restore giá trị gốc cho output
         result["warehouse_source"] = raw_warehouse.values
         result["io_status_source"] = raw_io_status.values
 
-
-        # 3. Tính predicted_arrival_time nếu có io_time
-        if "io_time" in df.columns:
-            io_time = pd.to_datetime(df["io_time"], errors="coerce")
-            io_date = io_time.dt.normalize()
-            result["predicted_arrival_time"] = (
-                io_date
-                + pd.to_timedelta(result["predicted_arrival_offset_hours"], unit="h")
-            )
+        # 5. Tính predicted_arrival_time nếu có io_time / snapshot_time
+        if "snapshot_time" in result.columns and result["snapshot_time"].notna().any():
+            base_time = pd.to_datetime(result["snapshot_time"], errors="coerce")
+        elif "io_time" in df.columns:
+            base_time = pd.to_datetime(df["io_time"], errors="coerce")
         else:
-            result["predicted_arrival_time"] = pd.NaT
+            base_time = pd.Series([pd.Timestamp.now()] * len(result))
 
-        # 4. Trả về kết quả gọn
+        result["predicted_arrival_time"] = (
+            base_time + pd.to_timedelta(result["predicted_arrival_offset_hours"], unit="h")
+        )
+
+        # 6. Trả về kết quả gọn
         output_cols = [
             "bill_code",
             "warehouse_source",
@@ -126,8 +175,6 @@ class ForecastingPredictor:
             "predicted_arrival_offset_hours",
             "predicted_arrival_time",
         ]
-        
-        # Bỏ các cột không có trong DataFrame
         output_cols = [c for c in output_cols if c in result.columns]
 
         return result[output_cols].copy()
@@ -138,17 +185,6 @@ class ForecastingPredictor:
     ) -> dict:
         """
         Predict cho 1 đơn hàng duy nhất.
-
-        Parameters
-        ----------
-        bill_info : dict
-            Thông tin đơn hàng và trạng thái hiện tại, VD:
-            {"warehouse_name": "Kho HN", "io_status": "IN", "io_time": "2026-01-15 08:00:00",
-             "bill_code": "B_123", "VD_type": "BillWebOnline", ...}
-
-        Returns
-        -------
-        dict với các key dự đoán
         """
         df = pd.DataFrame([bill_info])
         result = self.predict(df)
