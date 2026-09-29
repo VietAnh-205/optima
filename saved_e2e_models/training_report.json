@@ -1,0 +1,21 @@
+{
+  "classifier": {
+    "first_1A_top1_acc": 0.9668045905222891,
+    "first_1A_top3_acc": 0.9960808806308065,
+    "first_1A_weighted_f1": 0.9693081499825175,
+    "first_1A_macro_f1": 0.5533330335326904,
+    "last_1A_top1_acc": 0.990600359122492,
+    "last_1A_top3_acc": 0.9974080724490593,
+    "last_1A_weighted_f1": 0.9908021039034418,
+    "last_1A_macro_f1": 0.9080380185242815,
+    "combined_both_correct_acc": 0.960465297837458,
+    "n_test_bills": 64045
+  },
+  "regressor": {
+    "test_mae": 2.931701352394868,
+    "test_medae": 1.4744444444444444,
+    "test_r2": 0.33311908192718753,
+    "n_samples": 122737
+  },
+  "evaluated_at": "2026-09-18T10:26:09.787680"
+}

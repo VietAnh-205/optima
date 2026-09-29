@@ -48,7 +48,7 @@ wh_d1a = (sche_last[sche_last['wh_rank_rev'] == 1][['bill_code', 'warehouse_name
 
 pair_o = (wh_o.merge(wh_o1a, on = 'bill_code', how = 'inner'))
 pair_d = (wh_d1a.merge(wh_d, on = 'bill_code', how = 'inner')) 
-
+    
 pair_o = pair_o[~pair_o['kho_o'].isin(set_1a)]
 pair_o = pair_o[pair_o['kho_o1a'].isin(set_1a)]
 pair_d = pair_d[pair_d['kho_d1a'].isin(set_1a)] 

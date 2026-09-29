@@ -13,7 +13,6 @@ def _slug(name: str) -> str:
     VD: 'Kho Sóng Thần' → 'kho_song_than'
     """
     s = name.lower().strip()
-    # Bỏ dấu tiếng Việt cơ bản
     _vn_map = str.maketrans(
         "àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ",
         "aaaaaaaaaaaaaaaaaeeeeeeeeeeeiiiiiooooooooooooooooouuuuuuuuuuuyyyyyd",
