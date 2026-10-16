@@ -5,3 +5,11 @@
 *.pkl
 output_plot/
 analysis_data/output_plot/ 
+*.joblib
+
+# Python cache
+__pycache__/
+*.py[cod]
+
+# Generated ML cache
+saved_e2e_models/cache/

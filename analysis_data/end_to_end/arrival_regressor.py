@@ -371,19 +371,38 @@ class ArrivalRegressor:
         y_true = valid[target].values
         y_pred = preds["predicted_hours_to_first_1A"].values
 
+        errors = y_pred - y_true
+        abs_err = np.abs(errors)
+        sq_err = errors ** 2
+
         metrics = {
             "test_mae": float(mean_absolute_error(y_true, y_pred)),
             "test_medae": float(median_absolute_error(y_true, y_pred)),
+            "test_rmse": float(np.sqrt(np.mean(sq_err))),
+            "test_mape": float(np.mean(abs_err / np.clip(np.abs(y_true), 0.1, None)) * 100),
             "test_r2": float(r2_score(y_true, y_pred)),
+            "within_1h": float(np.mean(abs_err <= 1.0) * 100),
+            "within_2h": float(np.mean(abs_err <= 2.0) * 100),
+            "within_3h": float(np.mean(abs_err <= 3.0) * 100),
+            "within_5h": float(np.mean(abs_err <= 5.0) * 100),
+            "p90_error": float(np.percentile(abs_err, 90)),
+            "p95_error": float(np.percentile(abs_err, 95)),
+            "mean_error": float(np.mean(errors)),
             "n_samples": len(valid),
         }
 
         print("\n" + "-" * 50)
-        print("KẾT QUẢ ĐÁNH GIÁ ARRIVAL TIME REGRESSOR:")
-        print(f"  Số mẫu đánh giá : {metrics['n_samples']:,}")
-        print(f"  Test MAE        : {metrics['test_mae']:.4f} giờ")
-        print(f"  Test MedAE      : {metrics['test_medae']:.4f} giờ")
-        print(f"  Test R²         : {metrics['test_r2']:.4f}")
+        print("K?T QU? ??NH GI? ARRIVAL TIME REGRESSOR:")
+        print(f"  S? m?u ??nh gi? : {metrics['n_samples']:,}")
+        print(f"  Test MAE        : {metrics['test_mae']:.4f} gi?")
+        print(f"  Test MedAE      : {metrics['test_medae']:.4f} gi?")
+        print(f"  Test RMSE       : {metrics['test_rmse']:.4f} gi?")
+        print(f"  Test R?         : {metrics['test_r2']:.4f}")
+        print(f"  Within ?1h      : {metrics['within_1h']:.2f}%")
+        print(f"  Within ?2h      : {metrics['within_2h']:.2f}%")
+        print(f"  Within ?3h      : {metrics['within_3h']:.2f}%")
+        print(f"  Within ?5h      : {metrics['within_5h']:.2f}%")
+        print(f"  P90 Error       : {metrics['p90_error']:.4f} gi?")
         print("-" * 50)
 
         return metrics

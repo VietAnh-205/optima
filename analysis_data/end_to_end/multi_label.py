@@ -2,6 +2,11 @@
 
 import os
 import sys
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 from datetime import datetime
 import joblib
 import numpy as np
@@ -137,6 +142,69 @@ class EndToEndPipeline:
             result["current_io_status"] = reg_preds["io_status_source"].values
 
         return result
+
+    def predict_operational_window(
+        self,
+        df: pd.DataFrame,
+        cutoff_time,
+        window_start,
+        window_end,
+        route_pair: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Dự báo chuyên biệt cho Vận Hành Theo Ca (Operational Shift Planning):
+        Chuẩn hóa Giao thức Điểm Cắt Nghiệp Vụ (Cut-off Point Protocol):
+          1. Lọc mốc Cut-off: Chỉ xét các snapshot phát sinh trước hoặc tại cutoff_time.
+          2. Khử trùng lặp đa snapshot: Chỉ lấy bản ghi mới nhất của mỗi vận đơn (bill_code).
+          3. Lọc trạng thái luân chuyển (In-transit): Loại bỏ các đơn đã cập bến đích trước cutoff_time.
+          4. Dự báo qua pipeline End-to-End (Classifier -> Regressor).
+          5. Lọc các đơn có predicted_arrival_time rơi vào cửa sổ ca [window_start, window_end).
+        """
+        if not self.is_fitted:
+            raise RuntimeError("Pipeline chưa được huấn luyện. Hãy gọi train() hoặc load() trước.")
+
+        df_work = df.copy()
+        if "snapshot_time" in df_work.columns:
+            df_work["snapshot_time"] = pd.to_datetime(df_work["snapshot_time"], errors="coerce")
+        else:
+            df_work["snapshot_time"] = pd.Timestamp.now()
+
+        cutoff_ts = pd.to_datetime(cutoff_time)
+        ws_ts = pd.to_datetime(window_start)
+        we_ts = pd.to_datetime(window_end)
+
+        # 1. Chốt mốc cutoff
+        sub_cut = df_work[df_work["snapshot_time"] <= cutoff_ts]
+        if sub_cut.empty:
+            return pd.DataFrame()
+
+        # 2. Lấy snapshot mới nhất của từng đơn
+        sub_cut = sub_cut.sort_values("snapshot_time")
+        latest = sub_cut.drop_duplicates("bill_code", keep="last").copy()
+
+        # 3. Lọc các đơn còn đang luân chuyển trên đường (chưa đến đích trước cutoff)
+        if "arrival_time" in latest.columns:
+            latest["arrival_time"] = pd.to_datetime(latest["arrival_time"], errors="coerce")
+            in_transit = latest[latest["arrival_time"] >= cutoff_ts].copy()
+        else:
+            in_transit = latest.copy()
+
+        if in_transit.empty:
+            return pd.DataFrame()
+
+        # 4. Dự báo qua pipeline
+        preds = self.predict(in_transit)
+        in_transit["pred_first_1A"] = preds["first_1A"].values
+        in_transit["pred_last_1A"] = preds["last_1A"].values
+        in_transit["predicted_arrival_time"] = pd.to_datetime(preds["predicted_arrival_time"], errors="coerce")
+        in_transit["pred_pair"] = in_transit["pred_first_1A"].astype(str) + " -> " + in_transit["pred_last_1A"].astype(str)
+
+        # 5. Lọc đơn dự báo rơi vào khung ca [window_start, window_end)
+        mask_window = (in_transit["predicted_arrival_time"] >= ws_ts) & (in_transit["predicted_arrival_time"] < we_ts)
+        if route_pair is not None and route_pair != "ALL_ROUTES":
+            mask_window = mask_window & (in_transit["pred_pair"] == route_pair)
+
+        return in_transit[mask_window].copy()
 
     def predict_one(self, bill_info: dict) -> dict:
         df = pd.DataFrame([bill_info])
